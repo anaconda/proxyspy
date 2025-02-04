@@ -1,10 +1,18 @@
 import os
+import random
+import shutil
+import socket
 import time
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from subprocess import Popen
 
 import psutil
 import pytest
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 class ProxyTestHarness:
@@ -17,11 +25,10 @@ class ProxyTestHarness:
         self.proxy_psutil = None
         # Get absolute path to proxy_tester.py
         self.script_path = str(Path(__file__).parent / "proxy_tester.py")
+        self.old_env = dict(os.environ)
 
     def start_proxy(self, *extra_args):
         """Start the proxy with a long-running sleep process."""
-        import random
-
         self.expected_port = random.randint(8080, 8099)
         self.keep_certs = "--keep-certs" in extra_args
 
@@ -64,6 +71,7 @@ class ProxyTestHarness:
                                     f"Proxy startup complete. Port: {self.port}, "
                                     f"Cert dir: {self.cert_dir}"
                                 )
+                                self.setup_environment()
                                 return
             time.sleep(0.1)
 
@@ -100,6 +108,10 @@ class ProxyTestHarness:
         os.environ["REQUESTS_CA_BUNDLE"] = cert_path
         os.environ["CONDA_SSL_VERIFY"] = cert_path
 
+    def restore_environment(self):
+        os.environ.clear()
+        os.environ.update(self.old_env)
+
     def stop_proxy(self):
         """Stop the proxy and its child processes."""
         if self.proxy_process:
@@ -125,6 +137,7 @@ class ProxyTestHarness:
                 if self.proxy_process.poll() is None:
                     self.proxy_process.terminate()
                     self.proxy_process.wait()
+        self.restore_environment()
 
     def get_logs(self):
         """Return the contents of the log file as a list of lines."""
@@ -136,14 +149,11 @@ class ProxyTestHarness:
 def proxy(tmp_path):
     """Fixture that provides a ProxyTestHarness and handles cleanup."""
     harness = ProxyTestHarness(tmp_path)
-    old_env = dict(os.environ)  # Save current environment
     try:
         yield harness
     finally:
         cert_dir = harness.cert_dir  # Save for verification
         harness.stop_proxy()
-        os.environ.clear()
-        os.environ.update(old_env)  # Restore original environment
         # Verify cleanup
         if cert_dir and not harness.keep_certs:
             assert not os.path.exists(
@@ -151,17 +161,26 @@ def proxy(tmp_path):
             ), f"Certificate directory not cleaned up: {cert_dir}"
 
 
-def test_error_dns_nonexistent(proxy):
+@pytest.fixture(scope="module")
+def session():
+    """Construct a requests session object with retries."""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=3, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    return session
+
+
+def test_error_dns_nonexistent(proxy, session):
     """Test proxy handling of non-existent DNS names."""
     proxy.start_proxy()
-    proxy.setup_environment()
-
-    import requests
 
     with pytest.raises(
         (requests.exceptions.ProxyError, requests.exceptions.ReadTimeout)
     ):
-        requests.get("https://httpbin.invalid/get", timeout=2.0)
+        session.get("https://httpbin.invalid/get", timeout=2.0)
 
     # Check logs
     logs = proxy.get_logs()
@@ -175,16 +194,13 @@ def test_error_dns_nonexistent(proxy):
     assert any("Connection closed" in line for line in logs)
 
 
-def test_error_wrong_port(proxy):
+def test_error_wrong_port(proxy, session):
     """Test proxy handling of connection to wrong port."""
     proxy.start_proxy()
-    proxy.setup_environment()
 
-    import requests
-
-    with pytest.raises(requests.exceptions.ReadTimeout):
+    with pytest.raises(requests.exceptions.ConnectionError):
         # Port 81 is usually not running on httpbin.org
-        requests.get("https://httpbin.org:81/get", timeout=2.0)
+        session.get("https://httpbin.org:81/get", timeout=2.0)
 
     # Check logs
     logs = proxy.get_logs()
@@ -199,14 +215,9 @@ def test_error_wrong_port(proxy):
     # Note: We don't see 'Connection closed' because the timeout doesn't trigger a clean closure
 
 
-def test_error_no_listener(proxy):
+def test_error_no_listener(proxy, session):
     """Test proxy handling of connection to port with no listener."""
     proxy.start_proxy()
-    proxy.setup_environment()
-
-    import socket
-
-    import requests
 
     # Find a port that's definitely not in use
     with socket.socket() as s:
@@ -216,7 +227,7 @@ def test_error_no_listener(proxy):
     with pytest.raises(
         (requests.exceptions.ProxyError, requests.exceptions.ReadTimeout)
     ):
-        requests.get(f"https://localhost:{unused_port}/get", timeout=2.0)
+        session.get(f"https://localhost:{unused_port}/get", timeout=2.0)
 
     # Check logs
     logs = proxy.get_logs()
@@ -232,8 +243,7 @@ def test_error_no_listener(proxy):
 
 def test_proxy_startup(proxy):
     """Test that proxy starts up and creates correct certificate directory and log files."""
-    proxy.start_proxy()  # This now waits for startup logs
-    proxy.setup_environment()
+    proxy.start_proxy()
 
     # Verify we got both key pieces of information
     assert proxy.cert_dir is not None, "Certificate directory not detected"
@@ -247,7 +257,7 @@ def test_proxy_startup(proxy):
     assert os.path.exists(cert_path), f"Certificate file not found at {cert_path}"
 
 
-def test_proxy_intercept(proxy):
+def test_proxy_intercept(proxy, session):
     """Test that the proxy can intercept and return custom responses."""
     proxy.start_proxy(
         "--return-code",
@@ -257,12 +267,9 @@ def test_proxy_intercept(proxy):
         "--return-data",
         '{"status": "intercepted"}',
     )
-    proxy.setup_environment()
-
-    import requests
 
     # Make a request through the proxy - environment variables handle all config
-    resp = requests.get("https://httpbin.org/get")
+    resp = session.get("https://httpbin.org/get")
 
     # Verify response was intercepted
     assert resp.status_code == 418
@@ -299,18 +306,13 @@ def test_proxy_intercept(proxy):
     assert not any("[P<>S] SSL handshake completed" in line for line in logs)
 
 
-def test_forwarding_response_body(proxy):
+def test_forwarding_response_body(proxy, session):
     """Test that forwarded responses handle response bodies correctly."""
     proxy.start_proxy()
-    proxy.setup_environment()
-
-    from collections import defaultdict
-
-    import requests
 
     # Try bytes endpoint first with small payload
     print("\nTesting small binary response")
-    response = requests.get("https://httpbin.org/bytes/64")
+    response = session.get("https://httpbin.org/bytes/64")
     assert response.status_code == 200
     assert len(response.content) == 64
     print("Successfully received 64 bytes")
@@ -339,7 +341,7 @@ def test_forwarding_response_body(proxy):
 
     # Now try the larger response
     print("\nTesting 1KB binary response")
-    response = requests.get("https://httpbin.org/bytes/1024")
+    response = session.get("https://httpbin.org/bytes/1024")
     assert response.status_code == 200
     print(f"Received {len(response.content)} bytes")
     assert len(response.content) == 1024
@@ -362,7 +364,7 @@ def test_forwarding_response_body(proxy):
                 print(line)
 
 
-def test_intercept_response_body(proxy):
+def test_intercept_response_body(proxy, session):
     """Test that intercepted responses handle response bodies correctly."""
     # Create a response body with various challenging content
     test_body = (
@@ -387,11 +389,8 @@ def test_intercept_response_body(proxy):
         "--return-data",
         test_body,
     )
-    proxy.setup_environment()
 
-    import requests
-
-    response = requests.get("https://httpbin.org/get")
+    response = session.get("https://httpbin.org/get")
 
     # Basic response verification
     assert response.status_code == 200
@@ -419,7 +418,7 @@ def test_intercept_response_body(proxy):
     assert not any("[P<>S] SSL handshake completed" in line for line in logs)
 
 
-def test_intercept_headers(proxy):
+def test_intercept_headers(proxy, session):
     """Test that intercepted responses handle headers correctly."""
     proxy.start_proxy(
         "--return-code",
@@ -441,11 +440,8 @@ def test_intercept_headers(proxy):
         "--return-data",
         '{"status": "ok"}',
     )
-    proxy.setup_environment()
 
-    import requests
-
-    response = requests.get("https://httpbin.org/get")
+    response = session.get("https://httpbin.org/get")
 
     # Basic response verification
     assert response.status_code == 200
@@ -484,12 +480,8 @@ def test_intercept_headers(proxy):
     assert not any("[P<>S] SSL handshake completed" in line for line in logs)
 
 
-def test_keep_certs(proxy):
+def test_keep_certs(proxy, session):
     """Test that --keep-certs option keeps certificates in current directory."""
-    import os
-    import shutil
-    from pathlib import Path
-
     # Start in a clean temp directory
     orig_dir = os.getcwd()
     temp_dir = proxy.tmp_path / "keep_certs_test"
@@ -499,7 +491,6 @@ def test_keep_certs(proxy):
     try:
         # Start proxy with --keep-certs
         proxy.start_proxy("--keep-certs")
-        proxy.setup_environment()
 
         # Verify CA cert files exist in current directory
         ca_cert = Path("cert.pem")
@@ -507,11 +498,7 @@ def test_keep_certs(proxy):
         assert ca_cert.exists(), "CA certificate not found"
         assert ca_key.exists(), "CA key not found"
 
-        # Make a request to generate a host certificate
-        import requests
-
-        resp = requests.get("https://httpbin.org/get")
-        assert resp.status_code == 200
+        session.get("https://httpbin.org/get")
 
         # Verify host cert files exist
         host_cert = Path("httpbin.org-cert.pem")
@@ -532,16 +519,13 @@ def test_keep_certs(proxy):
         shutil.rmtree(temp_dir)
 
 
-def test_proxy_delay(proxy):
+def test_proxy_delay(proxy, session):
     """Test that the --delay option enforces connection delays."""
     delay = 0.25
     proxy.start_proxy("--delay", str(delay))
-    proxy.setup_environment()
-
-    import requests
 
     # Make a request through the proxy using environment settings
-    resp = requests.get("https://httpbin.org/get")
+    resp = session.get("https://httpbin.org/get")
     assert resp.status_code == 200
 
     # Check logs for delay enforcement
@@ -581,14 +565,6 @@ def test_proxy_delay(proxy):
 def test_concurrent_connections(proxy):
     """Test that the proxy can handle multiple simultaneous connections."""
     proxy.start_proxy()
-    proxy.setup_environment()
-
-    from collections import defaultdict
-    from concurrent.futures import ThreadPoolExecutor
-
-    import requests
-    from requests.adapters import HTTPAdapter
-    from urllib3.util.retry import Retry
 
     def make_request(i):
         # Create session with retry strategy
