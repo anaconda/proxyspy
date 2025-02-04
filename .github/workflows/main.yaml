@@ -29,4 +29,5 @@ jobs:
       with:
         timeout_minutes: 10
         max_attempts: 3
+        shell: bash -el {0}
         command: pytest -v
