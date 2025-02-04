@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 
+# Copyright (c) 2024, Anaconda, Inc.
+# This file is distributed under a 3-clause BSD license.
+# For license details, see https://github.com/anaconda/proxy-tester/blob/main/LICENSE.txt
+
 """HTTPS debugging proxy that logs or intercepts HTTPS requests.
 
 Launches a proxy server that either forwards HTTPS requests while logging
