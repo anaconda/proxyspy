@@ -1,6 +1,4 @@
-python >=3.6
 cryptography
 requests
 pytest
 psutil
-
