@@ -43,20 +43,15 @@ class ProxyTestHarness:
         self.port = None
         while time.time() - start_time < 5:  # 5 second timeout
             if os.path.exists(self.log_file):
-                print("FOUND LOG FILE")
                 with open(self.log_file) as f:
                     lines = f.readlines()
                     for line in lines:
-                        print("LINE", line)
                         if "Certificate directory:" in line:
-                            print("FOUND CERT DIR", self.port)
                             self.cert_dir = line.split(": ")[1].strip()
                         elif "Proxy server started on port" in line:
-                            print("FOUND PORT", self.cert_dir)
                             self.port = int(line.split("port")[1].strip())
                             # Found both pieces of info
                             if self.cert_dir is not None and self.port is not None:
-                                print("FOUND BOTH")
                                 assert self.port == self.expected_port, \
                                     f"Port mismatch: got {self.port}, expected {self.expected_port}"
                                 print(f"Proxy startup complete. Port: {self.port}, Cert dir: {self.cert_dir}")
