@@ -76,18 +76,22 @@ Return custom response with headers and body:
 
 ## How It Works
 
-The proxy operates in two modes:
+The proxy operates in two modes and can optionally add delays to any connection:
 
 ### Forwarding Mode (default)
 - Creates a CA certificate and per-host certificates
 - Establishes SSL tunnels to requested hosts
 - Logs all traffic passing through
-- Optionally adds connection delays
 
 ### Interception Mode
 - Activated by specifying any of: --return-code, --return-data, --return-header
 - Returns custom responses instead of connecting to servers
 - Useful for testing application behavior
+
+### Connection Delays
+- Optional delay can be added to any connection in either mode
+- Delay occurs after connection but before SSL handshake
+- Useful for testing timeout and connection handling
 
 ## Development
 
@@ -109,3 +113,10 @@ When submitting pull requests, please:
 - Add tests for new features
 - Ensure all tests pass
 - Follow existing code style
+- Do not add third-party dependencies beyond the required `cryptography` package
+  - The proxy tester is designed to be a single, self-contained file
+  - Additional dependencies make it harder for users to incorporate into their projects
+
+## About This Project
+
+This project was primarily developed through a series of conversations with Claude 3.5 Sonnet, an AI assistant from Anthropic (https://claude.ai). The majority of the code, including the test suite and GitHub Actions configuration, was written by Claude in response to requirements and refinements from human developers. This collaborative approach demonstrates how AI assistance can help create well-tested, maintainable code while adhering to strict dependency and design constraints.
