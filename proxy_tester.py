@@ -35,7 +35,6 @@ import argparse
 import atexit
 import logging
 import os
-import re
 import select
 import shutil
 import socket
@@ -56,8 +55,6 @@ from cryptography.x509.oid import NameOID
 
 # _forward_data buffer size
 BUFFER_SIZE = 65536
-# regex to find newlines in binary data
-BINARY_NEWLINE = re.compile(rb"\r?\n")
 LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
 CONNECTION_FORMAT = "[%s/%.3f/%.3f] %s"  # cid, split, elapsed, message
 
@@ -229,32 +226,38 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self, blob, firstline=None, direction=None, include_binary=False
     ):
         """Split binary/text data into lines for logging, logging text and remaining byte count"""
-        global BINARY_NEWLINE
         lines = []
+        is_binary = False
         if firstline is not None:
             lines.append(firstline)
         if isinstance(blob, bytes):
             while blob:
-                m = BINARY_NEWLINE.search(blob)
-                line = blob if m is None else blob[: m.start()]
+                ndx = blob.find(b"\r\n")
+                line = blob if ndx < 0 else blob[:ndx]
                 try:
                     line = line.decode("iso-8859-1")
-                    blob = blob[m.end() :]  # noqa
+                    blob = b"" if ndx < 0 else blob[ndx + 2 :]  # noqa
                     if not line:
+                        is_binary = True
                         break
                     lines.append(line)
                 except UnicodeDecodeError:
+                    is_binary = True
                     break
         else:
             lines.extend(str(blob).strip().splitlines())
             blob = ""
-        if include_binary and blob:
-            lines.append("<+ %d bytes>" % len(blob))
-            blob = ""
+        if include_binary and (is_binary or not blob):
+            if blob:
+                lines.append("<+ %d bytes>" % len(blob))
+                blob = ""
+            else:
+                lines.append("<no data>")
+            is_binary = False
         if direction:
             lines[0] = "[%s] %s" % (direction, lines[0])
         self._log("\n  | ".join(lines))
-        return len(blob)
+        return len(blob), is_binary
 
     def do_CONNECT(self):
         self._multiline_log(
@@ -287,7 +290,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # Establish tunnel
             self.send_response(200, "Connection Established")
             self._multiline_log(
-                b"".join(self._headers_buffer), direction="P->C", include_binary=True
+                b"".join(self._headers_buffer) + b"\r\n",
+                direction="P->C",
+                include_binary=True,
             )
             self.end_headers()
 
@@ -300,25 +305,31 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if self.server.intercept_mode:
                 # Read the decrypted request
                 request = t_request = client.recv(BUFFER_SIZE)
+                data = (self.server.return_data or "").encode("utf-8")
                 while len(t_request) == BUFFER_SIZE:
                     t_request = client.recv(BUFFER_SIZE)
                     request += t_request
                 self._multiline_log(request, direction="C->P", include_binary=True)
 
-                # Build and send custom response
+                # Build and send custom response headers
                 response = ["HTTP/1.1 %d Intercepted" % self.server.return_code]
                 response.extend(": ".join(h) for h in self.server.return_headers)
-                if self.server.return_data:
-                    c_len = len(self.server.return_data)
-                    response.append("Content-Length: %d" % c_len)
-                response.extend(["", self.server.return_data or ""])
+                if data:
+                    response.append("Content-Length: %d" % len(data))
+                response.extend(("", ""))
                 response = "\r\n".join(response).encode("iso-8859-1")
+                self._multiline_log(response, direction="P->C", include_binary=False)
+                client.sendall(response)
 
-                self._multiline_log(response, direction="P->C", include_binary=True)
-                client.send(response)
+                # Send response data if provided
+                if data:
+                    client.sendall(data)
+                    self._log("[P->C] %d data bytes delivered", len(data))
             else:
                 # Create SSL context for the server connection (verify remote)
+                self._log("About to create connection to %s:%d", host, int(port))
                 remote = socket.create_connection((host, int(port)))
+                self._log("About to wrap socket")
                 server_context = ssl.create_default_context()
                 remote = server_context.wrap_socket(remote, server_hostname=host)
                 self._log("[P<>S] SSL handshake completed")
@@ -352,50 +363,55 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _forward_data(self, client, remote):
         """Forward data between client and remote, logging headers and tracking binary data size"""
 
-        def forward(source, destination, direction, bcount):
+        def forward(source, destination, direction, bcount, is_binary):
             try:
                 data = source.recv(BUFFER_SIZE)
                 if not data:
-                    return False, bcount
+                    return False, bcount, is_binary
             except (OSError, ssl.SSLError) as exc:
                 self._log("%s: Receive error: %s", direction, exc, level="error")
-                return False, bcount
+                return False, bcount, is_binary
 
-            if bcount == 0:
-                # First chunk contains headers; subsequent chunks may be binary
-                ncount = self._multiline_log(data, direction=direction)
-                bcount += ncount
-            else:
+            if is_binary:
                 bcount += len(data)
+            else:
+                # First chunk contains headers; subsequent chunks may be binary
+                ncount, is_binary = self._multiline_log(data, direction=direction)
+                bcount += ncount
 
             try:
                 destination.sendall(data)
-                return True, bcount
+                return True, bcount, is_binary
             except Exception as exc:
                 self._log("%s: Send error: %s", direction, exc, level="error")
-                return False, bcount
+                return False, bcount, is_binary
 
         # Track binary data for each direction separately
         c_total = r_total = 0
+        c_binary = r_binary = False
         while True:
             # 1 second timeout to check for connection closure
             r, w, e = select.select([client, remote], [], [], 1.0)
             if not r:
                 break
             if client in r:
-                success, c_total = forward(client, remote, "C->S", c_total)
+                success, c_total, c_binary = forward(
+                    client, remote, "C->S", c_total, c_binary
+                )
                 if not success:
                     break
             if remote in r:
-                success, r_total = forward(remote, client, "S->C", r_total)
+                success, r_total, r_binary = forward(
+                    remote, client, "S->C", r_total, r_binary
+                )
                 if not success:
                     break
 
         # Deliver final binary totals
         if c_total:
-            self._log("[C->S] %d additional bytes sent", c_total)
+            self._log("[C->S] %d data bytes sent", c_total)
         if r_total:
-            self._log("[S->C] %d additional bytes received", r_total)
+            self._log("[S->C] %d data bytes received", r_total)
 
 
 #
