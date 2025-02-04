@@ -1,31 +1,111 @@
+# HTTPS Debug Proxy
+
+A debugging proxy that can log or intercept HTTPS requests. This tool can be used to:
+- Monitor HTTPS traffic from applications
+- Debug SSL/TLS issues
+- Test applications against specific HTTP responses
+- Simulate network delays
+
+## Features
+
+- Full HTTPS request/response logging
+- Custom response injection
+- Automatic certificate generation
+- Connection delays for testing
+- Concurrent connection support
+- Binary data handling
+
+## Installation
+
+The proxy is distributed as a single Python file `proxy_tester.py`. To use it in your project:
+
+1. Copy `proxy_tester.py` into your repository
+2. Ensure the `cryptography` package is available in your Python environment
+
+That's it! The script is self-contained and ready to use.
+
+## Development Requirements
+
+To develop or test the proxy itself, additional packages are required:
+```bash
+conda install --file requirements.txt
 ```
-HTTPS debugging proxy that logs or intercepts HTTPS requests.
 
-Launches a proxy server that either forwards HTTPS requests while logging
-headers and content, or intercepts requests and returns specified responses.
-Manages certificates automatically and supports concurrent connections.
-The script relies on the cryptography library to generate SSL certificates
-for the proxy, but deliberately avoids other third-party dependencies.
+This will install:
+- cryptography (required for proxy operation)
+- requests (for tests)
+- pytest (for running tests)
 
-Arguments:
-    --logfile, -l FILE    Write logs to FILE instead of stdout
-    --port, -p PORT       Listen on PORT (default: 8080)
-    --keep-certs          Keep certificates in current directory
-    --delay TIME          Emulate a connection delay of TIME seconds
-    --return-code, -r N   Return status code N for all requests
-    --return-header H     Add header H to responses (can repeat)
-    --return-data DATA    Return DATA as response body
+## Usage
 
-Examples:
-    # Log all HTTPS requests to test.log:
-    ./proxy_tester.py --logfile test.log -- curl https://httpbin.org/ip
-
-    # Return 404 for all requests, but with a half-second delay:
-    ./proxy_tester.py --return-code 404 --delay 0.5 -- python my_script.py
-
-    # Return custom response with headers and body:
-    ./proxy_tester.py --return-code 200 \\
-                      --return-header "Content-Type: application/json" \\
-                      --return-data '{"status": "ok"}' \\
-                      -- ./my_script.py
+```bash
+./proxy_tester.py [options] -- command [args...]
 ```
+
+The tool starts a proxy server and then runs the specified command with appropriate proxy environment variables set.
+
+### Options
+
+- `--logfile FILE, -l FILE`: Write logs to FILE (default: stdout)
+- `--port PORT, -p PORT`: Listen on PORT (default: 8080)
+- `--keep-certs`: Keep certificates in current directory
+- `--delay TIME`: Add TIME seconds delay to each connection
+- `--return-code N, -r N`: Return status code N for all requests
+- `--return-header H`: Add header H to responses (can repeat)
+- `--return-data DATA`: Return DATA as response body
+
+### Examples
+
+Log all HTTPS requests to test.log:
+```bash
+./proxy_tester.py --logfile test.log -- curl https://httpbin.org/ip
+```
+
+Return 404 for all requests with a half-second delay:
+```bash
+./proxy_tester.py --return-code 404 --delay 0.5 -- python my_script.py
+```
+
+Return custom response with headers and body:
+```bash
+./proxy_tester.py --return-code 200 \
+                  --return-header "Content-Type: application/json" \
+                  --return-data '{"status": "ok"}' \
+                  -- ./my_script.py
+```
+
+## How It Works
+
+The proxy operates in two modes:
+
+### Forwarding Mode (default)
+- Creates a CA certificate and per-host certificates
+- Establishes SSL tunnels to requested hosts
+- Logs all traffic passing through
+- Optionally adds connection delays
+
+### Interception Mode
+- Activated by specifying any of: --return-code, --return-data, --return-header
+- Returns custom responses instead of connecting to servers
+- Useful for testing application behavior
+
+## Development
+
+Run tests:
+```bash
+pytest -v
+```
+
+The test suite covers:
+- Basic forwarding
+- Response interception
+- Binary data handling
+- Connection delays
+- Error conditions
+
+## Contributing
+
+When submitting pull requests, please:
+- Add tests for new features
+- Ensure all tests pass
+- Follow existing code style
