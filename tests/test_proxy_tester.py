@@ -16,6 +16,27 @@ from requests.exceptions import ConnectionError, ProxyError, ReadTimeout, Reques
 from urllib3.util.retry import Retry
 
 
+def find_proxy_tester():
+    """Locate the proxy_tester script in development or installed environments."""
+    # First check if proxy-tester is installed in PATH
+    for path_dir in os.environ.get("PATH", "").split(os.pathsep):
+        # Look for either 'proxy-tester' or 'proxy-tester.exe' on Windows
+        for name in ['proxy-tester', 'proxy-tester.exe']:
+            candidate = os.path.join(path_dir, name)
+            if os.path.isfile(candidate):
+                return candidate
+    
+    # Then look for proxy_tester.py in development location
+    script_path = Path(__file__).parent.parent / "proxy_tester.py"
+    if script_path.exists():
+        return str(script_path)
+        
+    raise FileNotFoundError(
+        "Could not find proxy_tester script. "
+        "It should either be installed in PATH or present in development directory."
+    )
+
+
 class ProxyTestHarness:
     """Test harness that manages the lifecycle of a proxy_tester.py instance."""
 
@@ -24,10 +45,7 @@ class ProxyTestHarness:
         self.log_file = tmp_path / "test.log"
         self.proxy_process = None
         self.proxy_psutil = None
-        if os.path.isfile("proxy_tester.py"):
-            self.script_path = Path("proxy_tester.py").absolute()
-        else:
-            self.script_path = "proxy_tester.py"
+        self.script_path = find_proxy_tester()
         self.old_env = dict(os.environ)
         self.logs = None
 
