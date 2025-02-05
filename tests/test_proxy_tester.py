@@ -24,8 +24,7 @@ class ProxyTestHarness:
         self.log_file = tmp_path / "test.log"
         self.proxy_process = None
         self.proxy_psutil = None
-        # Get absolute path to proxy_tester.py
-        self.script_path = str(Path(__file__).parent / "proxy_tester.py")
+        self.script_path = Path("proxy_tester.py").absolute()
         self.old_env = dict(os.environ)
         self.logs = None
 
@@ -34,7 +33,7 @@ class ProxyTestHarness:
         self.expected_port = random.randint(8080, 8099)
         self.keep_certs = "--keep-certs" in extra_args
 
-        cmd = ["python", self.script_path]
+        cmd = ["python", str(self.script_path)]
         if "--logfile" not in extra_args:
             cmd.extend(("--logfile", str(self.log_file)))
         if "--port" not in extra_args:
