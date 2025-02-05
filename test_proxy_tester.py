@@ -12,6 +12,7 @@ import psutil
 import pytest
 import requests
 from requests.adapters import HTTPAdapter
+from requests.exceptions import ConnectionError, ProxyError, ReadTimeout, RequestException
 from urllib3.util.retry import Retry
 
 
@@ -32,18 +33,14 @@ class ProxyTestHarness:
         self.expected_port = random.randint(8080, 8099)
         self.keep_certs = "--keep-certs" in extra_args
 
-        cmd = [
-            "python",
-            self.script_path,
-            "--logfile",
-            str(self.log_file),
-            "--port",
-            str(self.expected_port),
-            *extra_args,
-            "--",
-            "sleep",
-            "3600",  # Long-running process to keep proxy alive
-        ]
+        cmd = ["python", self.script_path]
+        if "--logfile" not in extra_args:
+            cmd.extend(("--logfile", str(self.log_file)))
+        if "--port" not in extra_args:
+            cmd.extend(("--port", str(self.expected_port)))
+        cmd.extend(extra_args)
+        # Long-running process to keep proxy alive
+        cmd.extend(("--", "sleep", "3600"))
         print(f"\nStarting proxy server: {' '.join(cmd)}")
         self.proxy_process = Popen(cmd)
         self.proxy_psutil = psutil.Process(self.proxy_process.pid)
@@ -142,7 +139,11 @@ class ProxyTestHarness:
     def get_logs(self):
         """Return the contents of the log file as a list of lines."""
         with open(self.log_file) as f:
-            return f.readlines()
+            logs = f.readlines()
+        print("\nAll logs:")
+        for line in logs:
+            print(line.strip())
+        return logs
 
 
 @pytest.fixture
@@ -156,37 +157,32 @@ def proxy(tmp_path):
         harness.stop_proxy()
         # Verify cleanup
         if cert_dir and not harness.keep_certs:
-            assert not os.path.exists(
-                cert_dir
-            ), f"Certificate directory not cleaned up: {cert_dir}"
+            assert not os.path.exists(cert_dir), f"Certificate directory not cleaned up: {cert_dir}"
+
+
+def _get_session():
+    session = requests.Session()
+    retry_strategy = Retry(total=3, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    return session
 
 
 @pytest.fixture(scope="module")
 def session():
     """Construct a requests session object with retries."""
-    session = requests.Session()
-    retry_strategy = Retry(
-        total=3, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504]
-    )
-    adapter = HTTPAdapter(max_retries=retry_strategy)
-    session.mount("https://", adapter)
-    return session
+    return _get_session()
 
 
 def test_error_dns_nonexistent(proxy, session):
     """Test proxy handling of non-existent DNS names."""
     proxy.start_proxy()
 
-    with pytest.raises(
-        (requests.exceptions.ProxyError, requests.exceptions.ReadTimeout)
-    ):
+    with pytest.raises((ProxyError, ReadTimeout)):
         session.get("https://httpbin.invalid/get", timeout=2.0)
 
     # Check logs
     logs = proxy.get_logs()
-    print("\nAll logs:")
-    for line in logs:
-        print(line.strip())
 
     # Should see client connection and error
     assert any("[C->P] CONNECT httpbin.invalid:443" in line for line in logs)
@@ -198,15 +194,12 @@ def test_error_wrong_port(proxy, session):
     """Test proxy handling of connection to wrong port."""
     proxy.start_proxy()
 
-    with pytest.raises(requests.exceptions.ConnectionError):
+    with pytest.raises(ConnectionError):
         # Port 81 is usually not running on httpbin.org
         session.get("https://httpbin.org:81/get", timeout=2.0)
 
     # Check logs
     logs = proxy.get_logs()
-    print("\nAll logs:")
-    for line in logs:
-        print(line.strip())
 
     # Should see connection establishment but then timeout
     assert any("[C->P] CONNECT httpbin.org:81" in line for line in logs)
@@ -224,16 +217,11 @@ def test_error_no_listener(proxy, session):
         s.bind(("", 0))
         unused_port = s.getsockname()[1]
 
-    with pytest.raises(
-        (requests.exceptions.ProxyError, requests.exceptions.ReadTimeout)
-    ):
+    with pytest.raises((ProxyError, ReadTimeout)):
         session.get(f"https://localhost:{unused_port}/get", timeout=2.0)
 
     # Check logs
     logs = proxy.get_logs()
-    print("\nAll logs:")
-    for line in logs:
-        print(line.strip())
 
     # Should see attempt and connection refused
     assert any(f"[C->P] CONNECT localhost:{unused_port}" in line for line in logs)
@@ -278,26 +266,6 @@ def test_proxy_intercept(proxy, session):
 
     # Check logs to verify interception
     logs = proxy.get_logs()
-    print("\nAll logs:")
-    for line in logs:
-        print(line.strip())
-
-    # Verify SSL handshake completed (we're still terminating SSL)
-    assert any("[C<>P] SSL handshake completed" in line for line in logs)
-
-    # We should NOT see a server handshake since we're intercepting
-    assert not any("[P<>S] SSL handshake completed" in line for line in logs)
-
-    # Verify response was intercepted
-    assert resp.status_code == 418
-    assert resp.headers["X-Test"] == "Custom Header"
-    assert resp.json() == {"status": "intercepted"}
-
-    # Check logs to verify interception
-    logs = proxy.get_logs()
-    print("\nAll logs:")
-    for line in logs:
-        print(line.strip())
 
     # Verify SSL handshake completed (we're still terminating SSL)
     assert any("[C<>P] SSL handshake completed" in line for line in logs)
@@ -317,51 +285,12 @@ def test_forwarding_response_body(proxy, session):
     assert len(response.content) == 64
     print("Successfully received 64 bytes")
 
-    # Check logs to get connection info
-    logs = proxy.get_logs()
-
-    # Group logs by connection ID
-    connections = defaultdict(list)
-    for line in logs:
-        if "[" not in line:
-            continue
-        # Parse connection ID and timing
-        cid = line.split("[")[1].split("/")[0]
-        if cid.isdigit():
-            connections[cid].append(line.strip())
-
-    # Find the 64-byte request connection and analyze it
-    small_request_cid = None
-    for cid, lines in connections.items():
-        if any("bytes/64" in line for line in lines):
-            small_request_cid = cid
-            print(f"\nSmall request (connection {cid}):")
-            for line in lines:
-                print(line)
-
     # Now try the larger response
     print("\nTesting 1KB binary response")
     response = session.get("https://httpbin.org/bytes/1024")
     assert response.status_code == 200
     print(f"Received {len(response.content)} bytes")
     assert len(response.content) == 1024
-
-    # Get updated logs and find the 1KB request
-    logs = proxy.get_logs()
-    connections = defaultdict(list)
-    for line in logs:
-        if "[" not in line:
-            continue
-        cid = line.split("[")[1].split("/")[0]
-        if cid.isdigit() and cid != small_request_cid:  # Skip the previous connection
-            connections[cid].append(line.strip())
-
-    # Find and analyze the 1KB request connection
-    for cid, lines in connections.items():
-        if any("bytes/1024" in line for line in lines):
-            print(f"\nLarge request (connection {cid}):")
-            for line in lines:
-                print(line)
 
 
 def test_intercept_response_body(proxy, session):
@@ -395,18 +324,13 @@ def test_intercept_response_body(proxy, session):
     # Basic response verification
     assert response.status_code == 200
     assert response.headers["Content-Type"] == "text/plain"
-    assert int(response.headers["Content-Length"]) == len(
-        test_body
-    )  # Verify length matches
+    assert int(response.headers["Content-Length"]) == len(test_body)  # Verify length matches
 
     # The response body should match exactly, byte for byte
     assert response.text == test_body
 
     # Check logs
     logs = proxy.get_logs()
-    print("\nAll logs:")
-    for line in logs:
-        print(line.strip())
 
     # Find the intercepted response in logs
     # It should appear as one complete chunk in the log
@@ -461,17 +385,12 @@ def test_intercept_headers(proxy, session):
 
     # Check logs
     logs = proxy.get_logs()
-    print("\nAll logs:")
-    for line in logs:
-        print(line.strip())
 
     # Verify that all headers appear in the proxy's output log
     assert any("Content-Type: application/json" in line for line in logs)
     assert any("X-Custom-String: Hello, World!" in line for line in logs)
     assert any("X-Custom-Empty:" in line for line in logs)
-    assert any(
-        "X-Custom-Special: Hello: world; something=value" in line for line in logs
-    )
+    assert any("X-Custom-Special: Hello: world; something=value" in line for line in logs)
     assert any("Set-Cookie: cookie1=value1" in line for line in logs)
     assert any("Set-Cookie: cookie2=value2" in line for line in logs)
 
@@ -533,11 +452,6 @@ def test_proxy_delay(proxy, session):
     assert any(f"Enforcing {delay}s delay" in line for line in logs)
     assert any("End of connection delay" in line for line in logs)
 
-    # Verify timing from logs
-    print("\nAll logs:")
-    for line in logs:
-        print(line.strip())
-
     # Find all delay-related lines
     delay_lines = [l for l in logs if "delay" in l]
     print("\nDelay lines:")
@@ -552,9 +466,7 @@ def test_proxy_delay(proxy, session):
     if enforcing_lines:
         end_lines = [l for l in delay_lines if "End of" in l]
         if end_lines:
-            end_time = float(
-                end_lines[0].split("/")[2].split("]")[0]
-            )  # Total elapsed at end
+            end_time = float(end_lines[0].split("/")[2].split("]")[0])  # Total elapsed at end
             print(f"\nTotal elapsed at delay end: {end_time:.3f}s")
             # Verify we waited at least the requested delay
             assert end_time >= delay, f"Delay too short: {end_time:.3f}s < {delay}s"
@@ -568,18 +480,11 @@ def test_concurrent_connections(proxy):
 
     def make_request(i):
         # Create session with retry strategy
-        session = requests.Session()
-        retry_strategy = Retry(
-            total=3, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504]
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        session.mount("https://", adapter)
-
         url = f"https://httpbin.org/get?ndx={i}"
         try:
-            resp = session.get(url, timeout=5.0)
+            resp = _get_session().get(url, timeout=5.0)
             return resp.status_code, i
-        except requests.exceptions.RequestException as e:
+        except RequestException as e:
             print(f"\nRequest {i} failed: {str(e)}")
             return None, i
 
@@ -588,45 +493,36 @@ def test_concurrent_connections(proxy):
         futures = [executor.submit(make_request, i) for i in range(4)]
         results = [f.result() for f in futures]
 
-    # Check logs before checking results
-    logs = proxy.get_logs()
-    print("\nAll logs:")
-    for line in logs:
-        print(line.strip())
-
-    # Extract connection IDs and build timeline for each
-    connections = defaultdict(list)
-    for line in logs:
-        if "[" not in line:  # Skip non-connection log lines
-            continue
-        # Parse connection ID and timing
-        cid = line.split("[")[1].split("/")[0]
-        if cid.isdigit():  # Only track numbered connections
-            connections[cid].append(line.strip())
-
     # Analyze results and connections
     successful_requests = [r for r in results if r[0] is not None]
     failed_requests = [r for r in results if r[0] is None]
 
-    print(f"\nSuccessful requests: {len(successful_requests)}")
+    # Check logs before checking results
+    logs = proxy.get_logs()
+
+    # Group by connection
+    connections = defaultdict(list)
+    for line in logs:
+        if "[" in line:
+            cid = line.split("[")[1].split("/")[0]
+            if cid.isdigit():
+                connections[cid].append(line.strip())
+
+    print(f"Successful requests: {len(successful_requests)}")
     print(f"Failed requests: {len(failed_requests)}")
     print(f"Total connections seen: {len(connections)}")
 
     # Verify basic expectations
-    assert (
-        len(connections) >= 4
-    ), f"Expected at least 4 connections, got {len(connections)}"
+    assert len(connections) >= 4, f"Expected at least 4 connections, got {len(connections)}"
     assert len(successful_requests) > 0, "Expected at least some successful requests"
 
     # For successful connections, verify complete flow
     for cid, lines in connections.items():
         connect_lines = [l for l in lines if "[C->P] CONNECT" in l]
-        if not connect_lines:
-            continue  # Skip partial connections
-
-        assert any(
-            "[C<>P] SSL handshake completed" in l for l in lines
-        ), f"Connection {cid} missing client handshake"
-        assert any(
-            "[P<>S] SSL handshake completed" in l for l in lines
-        ), f"Connection {cid} missing server handshake"
+        if connect_lines:  # Skip partial connections
+            assert any(
+                "[C<>P] SSL handshake completed" in l for l in lines
+            ), f"Connection {cid} missing client handshake"
+            assert any(
+                "[P<>S] SSL handshake completed" in l for l in lines
+            ), f"Connection {cid} missing server handshake"

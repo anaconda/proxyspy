@@ -153,9 +153,7 @@ def read_or_create_cert(host=None):
             critical=False,
         )
     else:
-        cert = cert.add_extension(
-            x509.SubjectAlternativeName([x509.DNSName(host)]), critical=False
-        )
+        cert = cert.add_extension(x509.SubjectAlternativeName([x509.DNSName(host)]), critical=False)
 
     # Sign with CA key
     cert = cert.sign(CA_KEY, hashes.SHA256())
@@ -226,9 +224,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         getattr(logger, level)(fmt, *args[1:], **kwargs)
         self.last_time = n_time
 
-    def _multiline_log(
-        self, blob, firstline=None, direction=None, include_binary=False
-    ):
+    def _multiline_log(self, blob, firstline=None, direction=None, include_binary=False):
         """Split binary/text data into lines for logging, logging text and remaining byte count"""
         lines = []
         is_binary = False
@@ -399,15 +395,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if not r:
                 break
             if client in r:
-                success, c_total, c_binary = forward(
-                    client, remote, "C->S", c_total, c_binary
-                )
+                success, c_total, c_binary = forward(client, remote, "C->S", c_total, c_binary)
                 if not success:
                     break
             if remote in r:
-                success, r_total, r_binary = forward(
-                    remote, client, "S->C", r_total, r_binary
-                )
+                success, r_total, r_binary = forward(remote, client, "S->C", r_total, r_binary)
                 if not success:
                     break
 
@@ -430,9 +422,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="HTTPS debugging proxy that logs or intercepts HTTPS requests"
     )
-    parser.add_argument(
-        "--logfile", "-l", help="File to write logs to (defaults to stdout)"
-    )
+    parser.add_argument("--logfile", "-l", help="File to write logs to (defaults to stdout)")
     parser.add_argument(
         "--port",
         "-p",
@@ -498,10 +488,7 @@ def main():
     server.delay = max(0, args.delay)
 
     # Enable interception if any response-related args are provided
-    if (
-        any(x is not None for x in [args.return_code, args.return_data])
-        or args.return_header
-    ):
+    if any(x is not None for x in [args.return_code, args.return_data]) or args.return_header:
         server.intercept_mode = True
         server.return_code = args.return_code or 200
         server.return_data = args.return_data or ""
