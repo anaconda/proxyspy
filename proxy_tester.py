@@ -477,14 +477,14 @@ def main():
 
         def cleanup():
             logger.info("Removing temporary certificate directory")
-            shutil.rmtree(CERT_DIR, ignore_errors=True)
+            shutil.rmtree(CERT_DIR, ignore_errors=False)
 
         atexit.register(cleanup)
     logger.info("Certificate directory: %s", CERT_DIR)
     cert_path, key_path = read_or_create_cert()
 
     # Start and configure server
-    server = MyHTTPServer(("0.0.0.0", args.port), ProxyHandler)
+    server = MyHTTPServer(("127.0.0.1", args.port), ProxyHandler)
     server.delay = max(0, args.delay)
 
     # Enable interception if any response-related args are provided

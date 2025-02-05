@@ -10,20 +10,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Set up conda
       uses: conda-incubator/setup-miniconda@v3
       with:
         auto-activate-base: true
         python-version: "3.9"  # Minimum version required for conda-build
-    
+
     # Build pip package
     - name: Build pip package
       shell: bash -el {0}
       run: |
         pip install build
         python -m build
-    
+
     # Build conda package
     - name: Install conda-build
       shell: bash -el {0}
@@ -33,18 +33,17 @@ jobs:
       shell: bash -el {0}
       run: |
         conda build conda.recipe
-        # Copy the noarch package to a known location
-        mkdir -p dist/conda
-        cp ${CONDA_PREFIX}/conda-bld/noarch/proxy-tester-*.tar.bz2 dist/conda/
-    
+        # Create proper channel structure with noarch subdirectory
+        mkdir -p dist/conda/noarch
+        cp -r ${CONDA_PREFIX}/conda-bld/noarch dist/conda/
+        find dist
+
     # Upload both pip and conda packages as artifacts
     - name: Upload packages
       uses: actions/upload-artifact@v4
       with:
         name: packages
-        path: |
-          dist/*.whl
-          dist/conda/*.tar.bz2
+        path: dist
         retention-days: 1
 
   test:
@@ -55,40 +54,40 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
     runs-on: ${{ matrix.os }}
-    
+
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Set up conda
       uses: conda-incubator/setup-miniconda@v3
       with:
         auto-activate-base: true
         python-version: ${{ matrix.python-version }}
-    
+
     # Download built packages
     - name: Download packages
       uses: actions/download-artifact@v4
       with:
         name: packages
         path: dist
-    
+
     # Test conda package first
     - name: Test conda package
       shell: bash -el {0}
       run: |
+        find dist
         conda install -c ./dist/conda proxy-tester pytest requests psutil
-        cd tests
-        pytest -v
-        cd ..
-    
+        pytest -v tests
+
     # Remove conda package and test pip package
     - name: Test pip package
       shell: bash -el {0}
       run: |
         conda remove proxy-tester --force
-        pip install dist/*.whl[test]
-        cd tests
-        pytest -v
+        # Get the actual wheel filename and install it with test extras
+        wheel_file=$(ls dist/proxy_tester-*.whl)
+        pip install "${wheel_file}[test]"
+        pytest -v tests
 
   # Direct source tests (only on main as a final check)
   source-test:
@@ -99,7 +98,7 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
     runs-on: ${{ matrix.os }}
-    
+
     steps:
     - uses: actions/checkout@v4
     - name: Set up conda
@@ -107,7 +106,7 @@ jobs:
       with:
         auto-activate-base: true
         python-version: ${{ matrix.python-version }}
-    
+
     - name: Install test dependencies
       shell: bash -el {0}
       run: |
