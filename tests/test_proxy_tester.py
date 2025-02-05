@@ -24,7 +24,10 @@ class ProxyTestHarness:
         self.log_file = tmp_path / "test.log"
         self.proxy_process = None
         self.proxy_psutil = None
-        self.script_path = Path("proxy_tester.py").absolute()
+        if os.path.isfile("proxy_tester.py"):
+            self.script_path = Path("proxy_tester.py").absolute()
+        else:
+            self.script_path = "proxy_tester.py"
         self.old_env = dict(os.environ)
         self.logs = None
 

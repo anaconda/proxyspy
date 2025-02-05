@@ -1,9 +1,10 @@
-name: Run Tests
+name: Build and Test
 on:
   pull_request:
     branches: [ main ]
   push:
     branches: [ main ]
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -12,17 +13,49 @@ jobs:
       matrix:
         python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
     steps:
-    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+    - uses: actions/checkout@v4
     - name: Set up conda
-      uses: conda-incubator/setup-miniconda@505e6394dae86d6a5c7fbb6e3fb8938e3e863830 # v3
+      uses: conda-incubator/setup-miniconda@v3
       with:
         auto-activate-base: true
         python-version: ${{ matrix.python-version }}
-    - name: Install dependencies
+    
+    # Test the source code directly
+    - name: Install test dependencies
       shell: bash -el {0}
       run: |
         conda install --file requirements.txt
-    - name: Run tests
+    - name: Run direct tests
       shell: bash -el {0}
       run: |
-        pytest -v || pytest -v || pytest -v
+        pytest -v tests/
+    
+    # Test pip package
+    - name: Build pip package
+      shell: bash -el {0}
+      run: |
+        pip install build
+        python -m build
+    - name: Test pip package
+      shell: bash -el {0}
+      run: |
+        pip install dist/*.whl[test]
+        cd tests
+        pytest -v
+        cd ..
+    
+    # Test conda package
+    - name: Install conda-build
+      shell: bash -el {0}
+      run: |
+        conda install conda-build
+    - name: Build conda package
+      shell: bash -el {0}
+      run: |
+        conda build conda.recipe
+    - name: Install and test conda package
+      shell: bash -el {0}
+      run: |
+        conda install -c ${CONDA_PREFIX}/conda-bld/ proxy-tester pytest requests psutil
+        cd tests
+        pytest -v
