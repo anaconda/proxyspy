@@ -27,6 +27,7 @@ class ProxyTestHarness:
         # Get absolute path to proxy_tester.py
         self.script_path = str(Path(__file__).parent / "proxy_tester.py")
         self.old_env = dict(os.environ)
+        self.logs = None
 
     def start_proxy(self, *extra_args):
         """Start the proxy with a long-running sleep process."""
@@ -136,14 +137,40 @@ class ProxyTestHarness:
                     self.proxy_process.wait()
         self.restore_environment()
 
-    def get_logs(self):
+    def get_logs(self, force=False):
         """Return the contents of the log file as a list of lines."""
-        with open(self.log_file) as f:
-            logs = f.readlines()
-        print("\nAll logs:")
-        for line in logs:
-            print(line.strip())
-        return logs
+        if force or self.logs is None:
+            with open(self.log_file) as f:
+                self.logs = f.readlines()
+            print("\nAll logs:")
+            for line in self.logs:
+                print(line.strip())
+        return self.logs
+
+    def get_connections(self):
+        """Return dict of connections and their log lines."""
+        connections = defaultdict(list)
+        for line in self.get_logs():
+            if "[" in line:
+                cid = line.split("[")[1].split("/")[0]
+                if cid.isdigit():
+                    connections[cid].append(line.strip())
+        print(f"Total connections seen: {len(connections)}")
+        return connections
+
+    def verify_header(self, response, name, value):
+        """Verify a header exists in both response and logs."""
+        assert response.headers[name] == value
+        self.assert_log_contains(f"{name}: {value}")
+
+    def assert_log_contains(self, pattern):
+        """Assert logs contain a line matching pattern."""
+        assert any(pattern in line for line in self.get_logs())
+
+    def assert_intercepted(self):
+        """Assert logs show interception (client SSL but no server SSL)."""
+        self.assert_log_contains("[C<>P] SSL handshake completed")
+        assert not any("[P<>S] SSL handshake completed" in line for line in self.get_logs())
 
 
 @pytest.fixture
@@ -181,13 +208,10 @@ def test_error_dns_nonexistent(proxy, session):
     with pytest.raises((ProxyError, ReadTimeout)):
         session.get("https://httpbin.invalid/get", timeout=2.0)
 
-    # Check logs
-    logs = proxy.get_logs()
-
     # Should see client connection and error
-    assert any("[C->P] CONNECT httpbin.invalid:443" in line for line in logs)
-    assert any("Socket error:" in line for line in logs)
-    assert any("Connection closed" in line for line in logs)
+    proxy.assert_log_contains("[C->P] CONNECT httpbin.invalid:443")
+    proxy.assert_log_contains("Socket error:")
+    proxy.assert_log_contains("Connection closed")
 
 
 def test_error_wrong_port(proxy, session):
@@ -198,13 +222,10 @@ def test_error_wrong_port(proxy, session):
         # Port 81 is usually not running on httpbin.org
         session.get("https://httpbin.org:81/get", timeout=2.0)
 
-    # Check logs
-    logs = proxy.get_logs()
-
     # Should see connection establishment but then timeout
-    assert any("[C->P] CONNECT httpbin.org:81" in line for line in logs)
-    assert any("[P->C] HTTP/1.0 200 Connection Established" in line for line in logs)
-    assert any("[C<>P] SSL handshake completed" in line for line in logs)
+    proxy.assert_log_contains("[C->P] CONNECT httpbin.org:81")
+    proxy.assert_log_contains("[P->C] HTTP/1.0 200 Connection Established")
+    proxy.assert_log_contains("[C<>P] SSL handshake completed")
     # Note: We don't see 'Connection closed' because the timeout doesn't trigger a clean closure
 
 
@@ -220,13 +241,10 @@ def test_error_no_listener(proxy, session):
     with pytest.raises((ProxyError, ReadTimeout)):
         session.get(f"https://localhost:{unused_port}/get", timeout=2.0)
 
-    # Check logs
-    logs = proxy.get_logs()
-
     # Should see attempt and connection refused
-    assert any(f"[C->P] CONNECT localhost:{unused_port}" in line for line in logs)
-    assert any("Socket error:" in line for line in logs)
-    assert any("Connection closed" in line for line in logs)
+    proxy.assert_log_contains(f"[C->P] CONNECT localhost:{unused_port}")
+    proxy.assert_log_contains("Socket error:")
+    proxy.assert_log_contains("Connection closed")
 
 
 def test_proxy_startup(proxy):
@@ -261,17 +279,10 @@ def test_proxy_intercept(proxy, session):
 
     # Verify response was intercepted
     assert resp.status_code == 418
-    assert resp.headers["X-Test"] == "Custom Header"
+    proxy.verify_header(resp, "X-Test", "Custom Header")
     assert resp.json() == {"status": "intercepted"}
 
-    # Check logs to verify interception
-    logs = proxy.get_logs()
-
-    # Verify SSL handshake completed (we're still terminating SSL)
-    assert any("[C<>P] SSL handshake completed" in line for line in logs)
-
-    # We should NOT see a server handshake since we're intercepting
-    assert not any("[P<>S] SSL handshake completed" in line for line in logs)
+    proxy.assert_intercepted()
 
 
 def test_forwarding_response_body(proxy, session):
@@ -323,7 +334,7 @@ def test_intercept_response_body(proxy, session):
 
     # Basic response verification
     assert response.status_code == 200
-    assert response.headers["Content-Type"] == "text/plain"
+    proxy.verify_header(response, "Content-Type", "text/plain")
     assert int(response.headers["Content-Length"]) == len(test_body)  # Verify length matches
 
     # The response body should match exactly, byte for byte
@@ -338,8 +349,7 @@ def test_intercept_response_body(proxy, session):
     assert len(response_lines) > 0, "No response found in logs"
 
     # Verify response was intercepted (no server connection)
-    assert any("[C<>P] SSL handshake completed" in line for line in logs)
-    assert not any("[P<>S] SSL handshake completed" in line for line in logs)
+    proxy.assert_intercepted()
 
 
 def test_intercept_headers(proxy, session):
@@ -372,31 +382,21 @@ def test_intercept_headers(proxy, session):
     assert response.json() == {"status": "ok"}
 
     # Headers should exist and have correct values
-    assert response.headers["Content-Type"] == "application/json"
-    assert response.headers["X-Custom-String"] == "Hello, World!"
-    assert response.headers["X-Custom-Empty"] == ""
-    assert response.headers["X-Custom-Special"] == "Hello: world; something=value"
-    assert response.headers["X-Custom-Long"] == "x" * 1000
+    proxy.verify_header(response, "Content-Type", "application/json")
+    proxy.verify_header(response, "X-Custom-String", "Hello, World!")
+    proxy.verify_header(response, "X-Custom-Empty", "")
+    proxy.verify_header(response, "X-Custom-Special", "Hello: world; something=value")
+    proxy.verify_header(response, "X-Custom-Long", "x" * 1000)
 
     # Multiple Set-Cookie headers should be preserved separately
     assert len(response.cookies) == 2
     assert response.cookies["cookie1"] == "value1"
     assert response.cookies["cookie2"] == "value2"
-
-    # Check logs
-    logs = proxy.get_logs()
-
-    # Verify that all headers appear in the proxy's output log
-    assert any("Content-Type: application/json" in line for line in logs)
-    assert any("X-Custom-String: Hello, World!" in line for line in logs)
-    assert any("X-Custom-Empty:" in line for line in logs)
-    assert any("X-Custom-Special: Hello: world; something=value" in line for line in logs)
-    assert any("Set-Cookie: cookie1=value1" in line for line in logs)
-    assert any("Set-Cookie: cookie2=value2" in line for line in logs)
+    proxy.assert_log_contains("Set-Cookie: cookie1=value1")
+    proxy.assert_log_contains("Set-Cookie: cookie2=value2")
 
     # Verify response was intercepted
-    assert any("[C<>P] SSL handshake completed" in line for line in logs)
-    assert not any("[P<>S] SSL handshake completed" in line for line in logs)
+    proxy.assert_intercepted()
 
 
 def test_keep_certs(proxy, session):
@@ -449,8 +449,8 @@ def test_proxy_delay(proxy, session):
 
     # Check logs for delay enforcement
     logs = proxy.get_logs()
-    assert any(f"Enforcing {delay}s delay" in line for line in logs)
-    assert any("End of connection delay" in line for line in logs)
+    proxy.assert_log_contains(f"Enforcing {delay}s delay")
+    proxy.assert_log_contains("End of connection delay")
 
     # Find all delay-related lines
     delay_lines = [l for l in logs if "delay" in l]
@@ -496,23 +496,11 @@ def test_concurrent_connections(proxy):
     # Analyze results and connections
     successful_requests = [r for r in results if r[0] is not None]
     failed_requests = [r for r in results if r[0] is None]
-
-    # Check logs before checking results
-    logs = proxy.get_logs()
-
-    # Group by connection
-    connections = defaultdict(list)
-    for line in logs:
-        if "[" in line:
-            cid = line.split("[")[1].split("/")[0]
-            if cid.isdigit():
-                connections[cid].append(line.strip())
-
     print(f"Successful requests: {len(successful_requests)}")
     print(f"Failed requests: {len(failed_requests)}")
-    print(f"Total connections seen: {len(connections)}")
 
-    # Verify basic expectations
+    # Group logs by connection
+    connections = proxy.get_connections()
     assert len(connections) >= 4, f"Expected at least 4 connections, got {len(connections)}"
     assert len(successful_requests) > 0, "Expected at least some successful requests"
 
