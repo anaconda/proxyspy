@@ -2,3 +2,5 @@ cryptography
 requests
 pytest
 psutil
+hatchling
+conda-build

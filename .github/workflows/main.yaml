@@ -14,31 +14,25 @@ jobs:
     - name: Set up conda
       uses: conda-incubator/setup-miniconda@v3
       with:
+        activate-environment: ""
         auto-activate-base: true
-        python-version: "3.9"  # Minimum version required for conda-build
 
-    # Build pip package
+    - name: Install build packages
+      run: |
+        conda install conda-build hatchling
+
     - name: Build pip package
       shell: bash -el {0}
       run: |
-        pip install build
-        python -m build
+        python -m hatchling build
 
-    # Build conda package
-    - name: Install conda-build
-      shell: bash -el {0}
-      run: |
-        conda install conda-build
     - name: Build conda package
       shell: bash -el {0}
       run: |
-        conda build conda.recipe
-        # Create proper channel structure with noarch subdirectory
-        mkdir -p dist/conda/noarch
-        cp -r ${CONDA_PREFIX}/conda-bld/noarch dist/conda/
+        conda build conda.recipe --no-test
+        cp -r ${CONDA_PREFIX}/conda-bld dist/conda
         find dist
 
-    # Upload both pip and conda packages as artifacts
     - name: Upload packages
       uses: actions/upload-artifact@v4
       with:
@@ -51,8 +45,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-13, macos-14, windows-latest]
+        python-version: ["3.8", "3.10", "3.12"]
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -61,57 +55,30 @@ jobs:
     - name: Set up conda
       uses: conda-incubator/setup-miniconda@v3
       with:
+        activate-environment: ""
         auto-activate-base: true
-        python-version: ${{ matrix.python-version }}
 
-    # Download built packages
-    - name: Download packages
+    - name: Download built packages
       uses: actions/download-artifact@v4
       with:
         name: packages
         path: dist
 
-    # Test conda package first
-    - name: Test conda package
+    - name: Test package (conda)
       shell: bash -el {0}
       run: |
-        find dist
-        conda install -c ./dist/conda proxy-tester pytest requests psutil
+        conda_pkg=$(basename dist/conda/noarch/proxy-tester* | \
+                    sed -E 's@^(.*)-(.*)-(.*)[.](conda|tar.bz2)$@\1=\2=\3@')
+        conda create -n testconda -c ./dist/conda \
+          python=${{ matrix.python-version }} \
+          "$conda_pkg" pytest requests psutil
+        conda activate testconda
         pytest -v tests
 
-    # Remove conda package and test pip package
-    - name: Test pip package
+    - name: Test package (pip)
       shell: bash -el {0}
       run: |
-        conda remove proxy-tester --force
-        # Get the actual wheel filename and install it with test extras
         wheel_file=$(ls dist/proxy_tester-*.whl)
+        conda create -n testpip python=${{ matrix.python-version }}
         pip install "${wheel_file}[test]"
         pytest -v tests
-
-  # Direct source tests (only on main as a final check)
-  source-test:
-    if: github.ref == 'refs/heads/main'
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
-    runs-on: ${{ matrix.os }}
-
-    steps:
-    - uses: actions/checkout@v4
-    - name: Set up conda
-      uses: conda-incubator/setup-miniconda@v3
-      with:
-        auto-activate-base: true
-        python-version: ${{ matrix.python-version }}
-
-    - name: Install test dependencies
-      shell: bash -el {0}
-      run: |
-        conda install --file requirements.txt
-    - name: Run direct tests
-      shell: bash -el {0}
-      run: |
-        pytest -v tests/
