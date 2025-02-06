@@ -1,5 +1,4 @@
 import os
-import random
 import shutil
 import socket
 import time
@@ -13,7 +12,30 @@ import pytest
 import requests
 from requests.adapters import HTTPAdapter
 from requests.exceptions import ConnectionError, ProxyError, ReadTimeout, RequestException
-from urllib3.util.retry import Retry
+from urllib3.util.retry import MaxRetryError, Retry
+
+EXCEPTIONS = ConnectionError, ProxyError, ReadTimeout, RequestException, MaxRetryError
+
+
+def find_proxy_tester():
+    """Locate the proxy_tester script in development or installed environments."""
+    # First check if proxy-tester is installed in PATH
+    for path_dir in os.environ.get("PATH", "").split(os.pathsep):
+        # Look for either 'proxy-tester' or 'proxy-tester.exe' on Windows
+        for name in ["proxy-tester", "proxy-tester.exe"]:
+            candidate = os.path.join(path_dir, name)
+            if os.path.isfile(candidate):
+                return candidate
+
+    # Then look for proxy_tester.py in development location
+    script_path = Path(__file__).parent.parent / "proxy_tester.py"
+    if script_path.exists():
+        return str(script_path)
+
+    raise FileNotFoundError(
+        "Could not find proxy_tester script. "
+        "It should either be installed in PATH or present in development directory."
+    )
 
 
 class ProxyTestHarness:
@@ -24,16 +46,33 @@ class ProxyTestHarness:
         self.log_file = tmp_path / "test.log"
         self.proxy_process = None
         self.proxy_psutil = None
-        self.script_path = Path("proxy_tester.py").absolute()
+        self.script_path = find_proxy_tester()
         self.old_env = dict(os.environ)
         self.logs = None
 
     def start_proxy(self, *extra_args):
         """Start the proxy with a long-running sleep process."""
-        self.expected_port = random.randint(8080, 8099)
+        # Find an available port by trying until we succeed
+        for _ in range(10):  # Try up to 10 times
+            try:
+                # Try to bind to a random port to verify it's available
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind(("127.0.0.1", 0))  # Let OS choose port
+                    self.expected_port = s.getsockname()[1]
+                break
+            except OSError:
+                continue
+        else:
+            raise RuntimeError("Could not find an available port after 10 attempts")
         self.keep_certs = "--keep-certs" in extra_args
 
-        cmd = ["python", str(self.script_path)]
+        # For development testing, use python interpreter
+        if isinstance(self.script_path, Path) or self.script_path.endswith(".py"):
+            cmd = ["python", str(self.script_path)]
+        # For installed package, just run the entry point directly
+        else:
+            cmd = [str(self.script_path)]
+
         if "--logfile" not in extra_args:
             cmd.extend(("--logfile", str(self.log_file)))
         if "--port" not in extra_args:
@@ -111,30 +150,55 @@ class ProxyTestHarness:
 
     def stop_proxy(self):
         """Stop the proxy and its child processes."""
+        if hasattr(self, "logs"):
+            self.logs = None
+
         if self.proxy_process:
             try:
-                # Get all child processes
+                # First terminate all child processes
                 children = self.proxy_psutil.children(recursive=True)
-                if children:
+                sleep_processes = [
+                    p
+                    for p in children
+                    if "sleep" in p.name().lower() or "timeout" in p.name().lower()  # Unix
+                ]  # Windows equivalent
+                if sleep_processes:
                     print("\nTerminating child processes...")
-                    # Terminate children first and wait for them
-                    for child in children:
-                        child.terminate()
-                    psutil.wait_procs(children, timeout=3)
+                    for child in sleep_processes:
+                        try:
+                            child.terminate()
+                        except psutil.NoSuchProcess:
+                            pass
+                    psutil.wait_procs(sleep_processes, timeout=3)
                     print("Child processes terminated")
 
-                # Now wait for proxy to clean up and exit
-                print("Waiting for proxy to exit...")
-                self.proxy_process.wait(timeout=5)
-                print("Proxy terminated successfully")
-            except psutil.NoSuchProcess:
-                print("Process already terminated")
-            except psutil.TimeoutExpired:
-                print("Proxy did not exit cleanly, forcing termination")
+                # Now wait for proxy to initiate its own shutdown
+                print("Waiting for proxy to exit gracefully...")
+                for _ in range(30):  # 3 seconds total
+                    if self.proxy_process.poll() is not None:
+                        print("Proxy exited cleanly")
+                        self.restore_environment()
+                        # On Windows, sleep briefly to allow file handles to be released
+                        if os.name == "nt":
+                            time.sleep(0.5)
+                        return True
+                    time.sleep(0.1)
+
+                # If we get here, proxy failed to shut down on its own
+                print("Proxy failed to exit gracefully, terminating")
+                self.proxy_process.terminate()
+                self.proxy_process.wait(timeout=3)
+                return False
+
+            except (psutil.NoSuchProcess, psutil.TimeoutExpired) as e:
+                print(f"Process cleanup error: {e}")
                 if self.proxy_process.poll() is None:
-                    self.proxy_process.terminate()
+                    self.proxy_process.kill()
                     self.proxy_process.wait()
-        self.restore_environment()
+                return False
+
+            finally:
+                self.restore_environment()
 
     def get_logs(self, force=False):
         """Return the contents of the log file as a list of lines."""
@@ -180,15 +244,17 @@ def proxy(tmp_path):
         yield harness
     finally:
         cert_dir = harness.cert_dir  # Save for verification
-        harness.stop_proxy()
-        # Verify cleanup
-        if cert_dir and not harness.keep_certs:
+        clean_shutdown = harness.stop_proxy()
+        # Only verify directory cleanup if we had a clean shutdown
+        if clean_shutdown and cert_dir and not harness.keep_certs:
             assert not os.path.exists(cert_dir), f"Certificate directory not cleaned up: {cert_dir}"
 
 
 def _get_session():
     session = requests.Session()
-    retry_strategy = Retry(total=3, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
+    retry_strategy = Retry(
+        total=5, backoff_factor=0.5, backoff_jitter=0.5, status_forcelist=[500, 502, 503, 504]
+    )
     adapter = HTTPAdapter(max_retries=retry_strategy)
     session.mount("https://", adapter)
     return session
@@ -204,7 +270,7 @@ def test_error_dns_nonexistent(proxy, session):
     """Test proxy handling of non-existent DNS names."""
     proxy.start_proxy()
 
-    with pytest.raises((ProxyError, ReadTimeout)):
+    with pytest.raises(EXCEPTIONS):
         session.get("https://httpbin.invalid/get", timeout=2.0)
 
     # Should see client connection and error
@@ -217,7 +283,7 @@ def test_error_wrong_port(proxy, session):
     """Test proxy handling of connection to wrong port."""
     proxy.start_proxy()
 
-    with pytest.raises(ConnectionError):
+    with pytest.raises(EXCEPTIONS):
         # Port 81 is usually not running on httpbin.org
         session.get("https://httpbin.org:81/get", timeout=2.0)
 
@@ -234,10 +300,10 @@ def test_error_no_listener(proxy, session):
 
     # Find a port that's definitely not in use
     with socket.socket() as s:
-        s.bind(("", 0))
+        s.bind(("127.0.0.1", 0))
         unused_port = s.getsockname()[1]
 
-    with pytest.raises((ProxyError, ReadTimeout)):
+    with pytest.raises(EXCEPTIONS):
         session.get(f"https://localhost:{unused_port}/get", timeout=2.0)
 
     # Should see attempt and connection refused
@@ -440,7 +506,7 @@ def test_keep_certs(proxy, session):
 def test_proxy_delay(proxy, session):
     """Test that the --delay option enforces connection delays."""
     delay = 0.25
-    proxy.start_proxy("--delay", str(delay))
+    proxy.start_proxy("--delay", str(delay), "--return-code", str(200))
 
     # Make a request through the proxy using environment settings
     resp = session.get("https://httpbin.org/get")

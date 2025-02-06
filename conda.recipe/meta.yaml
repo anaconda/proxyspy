@@ -1,0 +1,53 @@
+{% set version = "0.1.0" %}
+
+package:
+  name: proxy-tester
+  version: {{ version }}
+
+source:
+  path: ../
+
+build:
+  number: 0
+  script: {{ PYTHON }} -m pip install . -vv
+  entry_points:
+    - proxy-tester = proxy_tester:main
+  noarch: python
+
+requirements:
+  host:
+    - python >=3.8
+    - pip
+    - setuptools
+  run:
+    - python >=3.8
+    - cryptography
+
+test:
+  requires:
+    - pytest
+    - requests
+    - psutil
+  source_files:
+    - tests
+  commands:
+    - pip check
+    - pytest -v
+
+about:
+  home: https://github.com/anaconda/proxy-tester
+  license: BSD-3-Clause
+  license_family: BSD
+  license_file: LICENSE.txt
+  summary: A debugging proxy that can log or intercept HTTPS requests
+  description: |
+    A debugging proxy that can log or intercept HTTPS requests. This tool can be used to:
+    - Monitor HTTPS traffic from applications
+    - Debug SSL/TLS issues
+    - Test applications against specific HTTP responses
+    - Simulate network delays
+  dev_url: https://github.com/anaconda/proxy-tester
+
+extra:
+  recipe-maintainers:
+    - conda
