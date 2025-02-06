@@ -64,6 +64,13 @@ jobs:
         name: packages
         path: dist
 
+    - name: Add random delay to space out tests
+      shell: bash -el {0}
+      run: |
+        DELAY=$(( $RANDOM % 20 ))
+        echo "Waiting $DELAY seconds before starting tests"
+        sleep $DELAY
+
     - name: Test package (conda)
       shell: bash -el {0}
       run: |
