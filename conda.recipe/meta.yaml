@@ -5,7 +5,7 @@ package:
   version: {{ version }}
 
 source:
-  path: ../
+  path: ..
 
 build:
   number: 0
@@ -18,7 +18,7 @@ requirements:
   host:
     - python >=3.8
     - pip
-    - setuptools
+    - hatchling
   run:
     - python >=3.8
     - cryptography
@@ -32,7 +32,7 @@ test:
     - tests
   commands:
     - pip check
-    - pytest -v
+    - pytest -v tests
 
 about:
   home: https://github.com/anaconda/proxy-tester

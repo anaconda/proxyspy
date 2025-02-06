@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "proxy-tester"
+version = "0.1.0"
+description = "A debugging proxy that can log or intercept HTTPS requests"
+readme = "README.md"
+license = { file = "LICENSE.txt" }
+authors = [
+    { name = "Anaconda, Inc.", email = "conda@anaconda.com" }
+]
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: BSD License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet :: Proxy Servers",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = [
+    "cryptography",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+    "requests",
+    "psutil",
+]
+
+[project.urls]
+Homepage = "https://github.com/anaconda/proxy-tester"
+Repository = "https://github.com/anaconda/proxy-tester"
+
+[project.scripts]
+proxy-tester = "proxy_tester:main"
