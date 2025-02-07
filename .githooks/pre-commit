@@ -1,0 +1,42 @@
+#!/bin/bash
+
+# Get the raw git describe output
+DESCRIBE=$(git describe --tags --dirty 2>/dev/null || echo "v0.0.0")
+DESCRIBE=${DESCRIBE#v}  # Remove v prefix
+
+# If we're in a pre-commit hook (not CI), strip the SHA
+if [ -z "${CI}" ]; then
+    DESCRIBE=${DESCRIBE%%-g*}  # Remove the g<SHA> portion
+fi
+
+# Convert git describe format to PEP 440
+# If it's just a tag (e.g. "0.1.0"), use as is
+# If it has commits after tag (e.g. "0.1.0-2-g690922b"), convert to "0.1.0.post2+g690922b"
+# If it's dirty, append ".dirty" to local version
+if [[ $DESCRIBE =~ ^([0-9]+\.[0-9]+\.[0-9]+)-([0-9]+)(-g[0-9a-f]+)?(-dirty)?$ ]]; then
+    VERSION="${BASH_REMATCH[1]}.post${BASH_REMATCH[2]}"
+    if [ -n "${BASH_REMATCH[3]}" ]; then
+        sha="${BASH_REMATCH[3]}"
+        VERSION="${VERSION}+${sha#-}"
+    fi
+    if [ -n "${BASH_REMATCH[4]}" ]; then
+        VERSION="${VERSION}+dirty"
+    fi
+else
+    VERSION="$DESCRIBE"
+fi
+
+# Update version in proxyspy.py
+sed -i.bak "s/__version__ = \".*\"/__version__ = \"${VERSION}\"/" proxyspy.py
+rm proxyspy.py.bak
+
+# Update version in pyproject.toml
+sed -i.bak "s/version = \".*\"/version = \"${VERSION}\"/" pyproject.toml
+rm pyproject.toml.bak
+
+# Update version in conda recipe
+sed -i.bak "s/{% set version = \".*\" %}/{% set version = \"${VERSION}\" %}/" conda.recipe/meta.yaml
+rm conda.recipe/meta.yaml.bak
+
+# Add all modified files back to staging
+git add proxyspy.py pyproject.toml conda.recipe/meta.yaml

@@ -10,6 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      with:
+        fetch-depth: 0 # Fetch all history for tags
 
     - name: Set up conda
       uses: conda-incubator/setup-miniconda@505e6394dae86d6a5c7fbb6e3fb8938e3e863830 # v3
@@ -20,6 +22,13 @@ jobs:
     - name: Install build packages
       run: |
         conda install conda-build hatchling
+
+    - name: Set version
+      run: |
+        chmod +x .githooks/pre-commit
+        .githooks/pre-commit
+        VERSION=$(grep "__version__ = " proxyspy.py | cut -d'"' -f2)
+        echo "Package version: $VERSION"
 
     - name: Build pip package
       shell: bash -el {0}

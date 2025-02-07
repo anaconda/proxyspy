@@ -57,6 +57,9 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
+# Modified by our pre-commit hook
+__version__ = "0.1.0.post1"
+
 # _forward_data buffer size
 BUFFER_SIZE = 65536
 LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
@@ -468,6 +471,9 @@ def main():
     else:
         logging_config["handlers"].append(logging.StreamHandler(sys.stdout))
     logging.basicConfig(**logging_config)
+
+    # Log version info immediately after logging setup
+    logger.info("ProxySpy version %s", __version__)
 
     # Set up certificate generation
     if args.keep_certs:
