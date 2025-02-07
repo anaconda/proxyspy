@@ -4,6 +4,7 @@ on:
     branches: [ main ]
   push:
     branches: [ main ]
+    tags: [ 'v*' ]
 
 jobs:
   build:
@@ -98,3 +99,83 @@ jobs:
         conda create -n testpip python=${{ matrix.python-version }}
         pip install "${wheel_file}[test]"
         pytest -v tests
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+    - name: Determine if we are actually publishing
+      id: set-mode
+      run: |
+        if [ ${{ github.event_name }} = "pull_request" ]; then
+          echo "Pull request; running in dry run mode."
+          echo "label=dry-run" >> $GITHUB_OUTPUT
+        elif [ ${{ github.ref }} == refs/tags/* ]; then
+          echo "Tagged version; publishing to conda and PyPi."
+          echo "label=main" >> $GITHUB_OUTPUT
+        else
+          echo "Untagged version; publishing to conda dev label only."
+          echo "label=dev" >> $GITHUB_OUTPUT
+        fi
+        error=no
+        if [ -z "${{ secrets.ANACONDA_CHANNEL }}" ]; then
+          echo "ERROR: missing the ANACONDA_CHANNEL secret"
+          error=yes
+        fi
+        if [ -z "${{ secrets.ANACONDA_TOKEN }}" ]; then
+          echo "ERROR: missing the ANACONDA_TOKEN secret"
+          error=yes
+        fi
+        if [ -z "${{ secrets.PYPI_API_TOKEN }}" ]; then
+          echo "ERROR: missing the PYPI_API_TOKEN secret"
+          error=yes
+        fi
+        if [ $error = yes ]; then
+          echo "Populate these secrets before proceeding."
+          false
+        fi
+
+    - name: Download built packages
+      uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4
+      with:
+        name: packages
+        path: dist
+
+    - name: Set up conda
+      uses: conda-incubator/setup-miniconda@505e6394dae86d6a5c7fbb6e3fb8938e3e863830 # v3
+      with:
+        activate-environment: ""
+        auto-activate-base: true
+
+    - name: Install publishing packages
+      run: |
+        conda install twine anaconda-client
+
+    - name: Publish to PyPI (tagged releases only)
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+      run: |
+        if [ ${{ steps.set-mode.label }} = dry-run ]; then
+          echo "Pull request; NOT publishing to PyPi."
+        elif [ ${{ steps.set-mode.label }} = dev ]; then
+          echo "Untagged build; NOT publishing to PyPi."
+        else
+          echo "Tagged build; publishing to PyPi."
+          twine upload dist/*.whl dist/*.tar.gz
+        fi
+
+    - name: Upload to Anaconda.org (tagged and untagged releases)
+      env:
+        TOKEN: ${{ secrets.ANACONDA_TOKEN }}
+      run: |
+        user=${{ secrets.ANACONDA_CHANNEL }}
+        if [ $mode = dry-run ]; then
+          echo "Pull request; NOT publishing to the channel '$user'."
+        else
+          label=${{ steps.set-mode.label }}
+          echo "Publishing to conda: channel '$user', label '$label'."
+          find dist/conda -name "*.tar.bz2" -o -name "*.conda" | while read file; do
+            anaconda upload --force --user $user --label $label "$file" --token $TOKEN
+          done
+        fi

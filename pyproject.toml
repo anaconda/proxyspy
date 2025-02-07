@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "proxyspy"
-version = "0.1.0.post1"
+version = "0.1.0.post5"
 description = "A debugging proxy that can log or intercept HTTPS requests"
 readme = "README.md"
 license = { file = "LICENSE.txt" }
