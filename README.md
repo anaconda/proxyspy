@@ -17,9 +17,9 @@ A debugging proxy that can log or intercept HTTPS requests. This tool can be use
 
 ## Installation
 
-The proxy is distributed as a single Python file `proxy_tester.py`. To use it in your project:
+The proxy is distributed as a single Python file `proxyspy.py`. To use it in your project:
 
-1. Copy `proxy_tester.py` into your repository
+1. Copy `proxyspy.py` into your repository
 2. Ensure the `cryptography` package is available in your Python environment
 
 That's it! The script is self-contained and ready to use.
@@ -39,7 +39,7 @@ This will install:
 ## Usage
 
 ```bash
-./proxy_tester.py [options] -- command [args...]
+./proxyspy.py [options] -- command [args...]
 ```
 
 The tool starts a proxy server and then runs the specified command with appropriate proxy environment variables set.
@@ -58,20 +58,20 @@ The tool starts a proxy server and then runs the specified command with appropri
 
 Log all HTTPS requests to test.log:
 ```bash
-./proxy_tester.py --logfile test.log -- curl https://httpbin.org/ip
+./proxyspy.py --logfile test.log -- curl https://httpbin.org/ip
 ```
 
 Return 404 for all requests with a half-second delay:
 ```bash
-./proxy_tester.py --return-code 404 --delay 0.5 -- python my_script.py
+./proxyspy.py --return-code 404 --delay 0.5 -- python my_script.py
 ```
 
 Return custom response with headers and body:
 ```bash
-./proxy_tester.py --return-code 200 \
-                  --return-header "Content-Type: application/json" \
-                  --return-data '{"status": "ok"}' \
-                  -- ./my_script.py
+./proxyspy.py --return-code 200 \
+              --return-header "Content-Type: application/json" \
+              --return-data '{"status": "ok"}' \
+              -- ./my_script.py
 ```
 
 ## How It Works

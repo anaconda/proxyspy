@@ -74,7 +74,7 @@ jobs:
     - name: Test package (conda)
       shell: bash -el {0}
       run: |
-        conda_pkg=$(basename dist/conda/noarch/proxy-tester* | \
+        conda_pkg=$(basename dist/conda/noarch/proxyspy-* | \
                     sed -E 's@^(.*)-(.*)-(.*)[.](conda|tar.bz2)$@\1=\2=\3@')
         conda create -n testconda -c ./dist/conda \
           python=${{ matrix.python-version }} \
@@ -85,7 +85,7 @@ jobs:
     - name: Test package (pip)
       shell: bash -el {0}
       run: |
-        wheel_file=$(ls dist/proxy_tester-*.whl)
+        wheel_file=$(ls dist/proxyspy-*.whl)
         conda create -n testpip python=${{ matrix.python-version }}
         pip install "${wheel_file}[test]"
         pytest -v tests
