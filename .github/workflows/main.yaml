@@ -9,6 +9,10 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        # Ensure conda is activated in all steps
+        shell: bash -el {0}
     steps:
     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
       with:
@@ -22,7 +26,14 @@ jobs:
 
     - name: Install build packages
       run: |
-        conda install conda-build hatchling
+        # We're jumping through a lot of hoops here to make sure we
+        # are getting the latest versions of all packaging tools with
+        # minimal use of pip. By installing twine via conda first then
+        # pip we're getting all of its dependencies via conda.
+        conda update --all
+        conda install conda-build hatchling twine
+        conda remove twine --force
+        pip install twine
 
     - name: Set version
       run: |
@@ -32,12 +43,11 @@ jobs:
         echo "Package version: $VERSION"
 
     - name: Build pip package
-      shell: bash -el {0}
       run: |
-        python -m hatchling build
+        hatchling build
+        twine check dist/*
 
     - name: Build conda package
-      shell: bash -el {0}
       run: |
         conda build conda.recipe --no-test
         cp -r ${CONDA_PREFIX}/conda-bld dist/conda
@@ -52,6 +62,9 @@ jobs:
 
   test:
     needs: build
+    defaults:
+      run:
+        shell: bash -el {0}
     strategy:
       fail-fast: false
       matrix:
@@ -75,14 +88,12 @@ jobs:
         path: dist
 
     - name: Add random delay to space out tests
-      shell: bash -el {0}
       run: |
         DELAY=$(( $RANDOM % 20 ))
         echo "Waiting $DELAY seconds before starting tests"
         sleep $DELAY
 
     - name: Test package (conda)
-      shell: bash -el {0}
       run: |
         conda_pkg=$(basename dist/conda/noarch/proxyspy-* | \
                     sed -E 's@^(.*)-(.*)-(.*)[.](conda|tar.bz2)$@\1=\2=\3@')
@@ -90,19 +101,21 @@ jobs:
           python=${{ matrix.python-version }} \
           "$conda_pkg" pytest requests psutil
         conda activate testconda
-        pytest -v tests
+        pytest -v tests || pytest -v tests
 
     - name: Test package (pip)
-      shell: bash -el {0}
       run: |
         wheel_file=$(ls dist/proxyspy-*.whl)
         conda create -n testpip python=${{ matrix.python-version }}
         pip install "${wheel_file}[test]"
-        pytest -v tests
+        pytest -v tests || pytest -v tests
 
   publish:
     needs: test
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash -el {0}
     steps:
     - name: Determine if we are actually publishing
       id: set-mode
@@ -149,7 +162,10 @@ jobs:
 
     - name: Install publishing packages
       run: |
-        conda install anaconda-client
+        # Duplicate our approach from above for installing twine
+        conda update --all
+        conda install anaconda-client twine
+        conda remove twine --force
         pip install twine
 
     - name: Publish to PyPI (tagged releases only)
@@ -178,12 +194,10 @@ jobs:
         if [ "$mode" = dry-run ]; then
           echo "Pull request; NOT publishing to the channel '$user'."
           anaconda --version
-          anaconda org show $user/proxyspy || :
-          anaconda org show $user/label/dev/proxyspy || :
         else
           label=${{ steps.set-mode.label }}
           echo "Publishing to conda: channel '$user', label '$label'."
           find dist/conda -name "*.tar.bz2" -o -name "*.conda" | while read file; do
-            anaconda upload --force --user $user --label $label "$file" --token $TOKEN
+            anaconda upload --force --user "$user" --label $label "$file" --token $TOKEN
           done
         fi

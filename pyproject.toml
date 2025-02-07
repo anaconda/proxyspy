@@ -44,3 +44,6 @@ Repository = "https://github.com/anaconda/proxyspy"
 
 [project.scripts]
 proxyspy = "proxyspy:main"
+
+[tool.setuptools]
+license-files = ["LICENSE.txt"]
