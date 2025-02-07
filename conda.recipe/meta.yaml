@@ -1,7 +1,8 @@
+{% set name = "proxyspy" %}
 {% set version = "0.1.0" %}
 
 package:
-  name: proxy-tester
+  name: {{ name }}
   version: {{ version }}
 
 source:
@@ -11,7 +12,7 @@ build:
   number: 0
   script: {{ PYTHON }} -m pip install . -vv
   entry_points:
-    - proxy-tester = proxy_tester:main
+    - proxyspy = proxyspy:main
   noarch: python
 
 requirements:
@@ -35,7 +36,7 @@ test:
     - pytest -v tests
 
 about:
-  home: https://github.com/anaconda/proxy-tester
+  home: https://github.com/anaconda/proxyspy
   license: BSD-3-Clause
   license_family: BSD
   license_file: LICENSE.txt
@@ -46,7 +47,7 @@ about:
     - Debug SSL/TLS issues
     - Test applications against specific HTTP responses
     - Simulate network delays
-  dev_url: https://github.com/anaconda/proxy-tester
+  dev_url: https://github.com/anaconda/proxyspy
 
 extra:
   recipe-maintainers:
