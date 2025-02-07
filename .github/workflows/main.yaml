@@ -149,29 +149,37 @@ jobs:
 
     - name: Install publishing packages
       run: |
-        conda install twine anaconda-client
+        conda install anaconda-client
+        pip install twine
 
     - name: Publish to PyPI (tagged releases only)
       env:
         TWINE_USERNAME: __token__
         TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
       run: |
-        if [ ${{ steps.set-mode.label }} = dry-run ]; then
+        mode="${{ steps.set-mode.outputs.label }}"
+        command=check
+        if [ "$mode" = dry-run ]; then
           echo "Pull request; NOT publishing to PyPi."
-        elif [ ${{ steps.set-mode.label }} = dev ]; then
+        elif [ "$mode" = dev ]; then
           echo "Untagged build; NOT publishing to PyPi."
         else
           echo "Tagged build; publishing to PyPi."
-          twine upload dist/*.whl dist/*.tar.gz
+          command=upload
         fi
+        twine $command dist/*.whl dist/*.tar.gz
 
     - name: Upload to Anaconda.org (tagged and untagged releases)
       env:
         TOKEN: ${{ secrets.ANACONDA_TOKEN }}
       run: |
+        mode=${{ steps.set-mode.outputs.label }}
         user=${{ secrets.ANACONDA_CHANNEL }}
-        if [ $mode = dry-run ]; then
+        if [ "$mode" = dry-run ]; then
           echo "Pull request; NOT publishing to the channel '$user'."
+          anaconda --version
+          anaconda org show $user/proxyspy || :
+          anaconda org show $user/label/dev/proxyspy || :
         else
           label=${{ steps.set-mode.label }}
           echo "Publishing to conda: channel '$user', label '$label'."
