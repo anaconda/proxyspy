@@ -123,7 +123,7 @@ jobs:
         if [ ${{ github.event_name }} = "pull_request" ]; then
           echo "Pull request; running in dry run mode."
           echo "label=dry-run" >> $GITHUB_OUTPUT
-        elif [ ${{ github.ref }} == refs/tags/* ]; then
+        elif [[ ${{ github.ref }} = refs/tags/* ]]; then
           echo "Tagged version; publishing to conda and PyPi."
           echo "label=main" >> $GITHUB_OUTPUT
         else
@@ -172,12 +172,12 @@ jobs:
       env:
         TWINE_USERNAME: __token__
         TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        LABEL: ${{ steps.set-mode.outputs.label }}
       run: |
-        mode="${{ steps.set-mode.outputs.label }}"
         command=check
-        if [ "$mode" = dry-run ]; then
+        if [ "$LABEL" = dry-run ]; then
           echo "Pull request; NOT publishing to PyPi."
-        elif [ "$mode" = dev ]; then
+        elif [ "$LABEL" = dev ]; then
           echo "Untagged build; NOT publishing to PyPi."
         else
           echo "Tagged build; publishing to PyPi."
@@ -187,17 +187,16 @@ jobs:
 
     - name: Upload to Anaconda.org (tagged and untagged releases)
       env:
-        TOKEN: ${{ secrets.ANACONDA_TOKEN }}
+        ANACONDA_API_TOKEN: ${{ secrets.ANACONDA_TOKEN }}
+        LABEL: ${{ steps.set-mode.outputs.label }}
+        USER: ${{ secrets.ANACONDA_CHANNEL }}
       run: |
-        mode=${{ steps.set-mode.outputs.label }}
-        user=${{ secrets.ANACONDA_CHANNEL }}
-        if [ "$mode" = dry-run ]; then
-          echo "Pull request; NOT publishing to the channel '$user'."
+        if [ "$LABEL" = dry-run ]; then
+          echo "Pull request; NOT publishing to the channel '$USER'."
           anaconda --version
         else
-          label=${{ steps.set-mode.label }}
-          echo "Publishing to conda: channel '$user', label '$label'."
+          echo "Publishing to conda: channel '$USER', label '$LABEL'."
           find dist/conda -name "*.tar.bz2" -o -name "*.conda" | while read file; do
-            anaconda upload --force --user "$user" --label $label "$file" --token $TOKEN
+            anaconda upload --force -u "$USER" -l "$LABEL" "$file"
           done
         fi
