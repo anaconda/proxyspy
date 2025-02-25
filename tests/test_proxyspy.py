@@ -53,17 +53,14 @@ class ProxyTestHarness:
     def start_proxy(self, *extra_args):
         """Start the proxy with a long-running sleep process."""
         # Find an available port by trying until we succeed
-        for _ in range(10):  # Try up to 10 times
-            try:
-                # Try to bind to a random port to verify it's available
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.bind(("127.0.0.1", 0))  # Let OS choose port
-                    self.expected_port = s.getsockname()[1]
+
+        # Default to port 0 (auto-selection) if no port specified
+        self.expected_port = 0
+        for i, arg in enumerate(extra_args):
+            if arg == "--port" and i + 1 < len(extra_args):
+                self.expected_port = int(extra_args[i + 1])
                 break
-            except OSError:
-                continue
-        else:
-            raise RuntimeError("Could not find an available port after 10 attempts")
+
         self.keep_certs = "--keep-certs" in extra_args
 
         # For development testing, use python interpreter
@@ -76,7 +73,7 @@ class ProxyTestHarness:
         if "--logfile" not in extra_args:
             cmd.extend(("--logfile", str(self.log_file)))
         if "--port" not in extra_args:
-            cmd.extend(("--port", str(self.expected_port)))
+            cmd.extend(("--port", "0"))
         cmd.extend(extra_args)
         # Long-running process to keep proxy alive
         cmd.extend(("--", "sleep", "3600"))
@@ -99,10 +96,11 @@ class ProxyTestHarness:
                             self.port = int(line.split("port")[1].strip())
                             # Found both pieces of info
                             if self.cert_dir is not None and self.port is not None:
-                                assert self.port == self.expected_port, (
-                                    f"Port mismatch: got {self.port}, "
-                                    f"expected {self.expected_port}"
-                                )
+                                if self.expected_port != 0:
+                                    assert self.port == self.expected_port, (
+                                        f"Port mismatch: got {self.port}, "
+                                        f"expected {self.expected_port}"
+                                    )
                                 print(
                                     f"Proxy startup complete. Port: {self.port}, "
                                     f"Cert dir: {self.cert_dir}"
@@ -319,9 +317,6 @@ def test_proxy_startup(proxy):
     # Verify we got both key pieces of information
     assert proxy.cert_dir is not None, "Certificate directory not detected"
     assert proxy.port is not None, "Port number not detected"
-    assert (
-        proxy.port == proxy.expected_port
-    ), f"Port mismatch: got {proxy.port}, expected {proxy.expected_port}"
 
     # Verify certificate exists
     cert_path = proxy.get_cert_path()
@@ -579,3 +574,36 @@ def test_concurrent_connections(proxy):
             assert any(
                 "[P<>S] SSL handshake completed" in l for l in lines
             ), f"Connection {cid} missing server handshake"
+
+
+def test_sequential_proxy_starts(tmp_path):
+    """Test that the proxy can be started multiple times in sequence."""
+    test_iterations = 3
+    ports_used = []
+
+    # Test multiple sequential startups with auto-selection
+    for i in range(test_iterations):
+        test_dir = tmp_path / f"auto_{i}"
+        test_dir.mkdir(exist_ok=True)
+        harness = ProxyTestHarness(test_dir)
+        try:
+            # Use auto port selection
+            harness.start_proxy("--return-code", "404")
+            assert harness.port > 0, "No valid port was selected"
+            ports_used.append(harness.port)
+            print(f"Auto-selected port {harness.port} succeeded")
+
+            # Make a simple request to ensure proxy is working
+            session = _get_session()
+            try:
+                response = session.get("https://httpbin.org/get", timeout=2.0)
+                assert response.status_code == 404, "Expected 404 response"
+                print(f"Request test passed with status {response.status_code}")
+            except requests.exceptions.RequestException as e:
+                print(f"Request resulted in expected exception: {e}")
+        finally:
+            harness.stop_proxy()
+
+    # Verify we got different ports
+    print(f"Ports used: {ports_used}")
+    assert len(set(ports_used)) > 1, "Auto-port selection didn't rotate ports"

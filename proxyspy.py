@@ -58,7 +58,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 # Modified by our pre-commit hook
-__version__ = "0.1.0.post5"
+__version__ = "0.1.1.post4"
 
 # _forward_data buffer size
 BUFFER_SIZE = 65536
@@ -413,6 +413,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._log("[S->C] %d data bytes received", r_total)
 
 
+def find_free_port():
+    """Find a free port that's not in TIME_WAIT state."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))  # Let OS choose port
+        return s.getsockname()[1]
+
+
 #
 # Command-line interface
 #
@@ -430,8 +437,8 @@ def main():
         "--port",
         "-p",
         type=int,
-        default=8080,
-        help="Port for the proxy server (default: 8080)",
+        default=0,
+        help="Port for the proxy server (default: auto-select)",
     )
     parser.add_argument(
         "--delay",
@@ -490,7 +497,11 @@ def main():
     cert_path, key_path = read_or_create_cert()
 
     # Start and configure server
-    server = MyHTTPServer(("127.0.0.1", args.port), ProxyHandler)
+    port = args.port
+    if port == 0:
+        port = find_free_port()
+        logger.info("Auto-selected port %d", port)
+    server = MyHTTPServer(("127.0.0.1", port), ProxyHandler)
     server.delay = max(0, args.delay)
 
     # Enable interception if any response-related args are provided
@@ -512,7 +523,7 @@ def main():
     server_thread = Thread(target=server.serve_forever)
     server_thread.daemon = True
     server_thread.start()
-    logger.info("Proxy server started on port %d", args.port)
+    logger.info("Proxy server started on port %d", port)
 
     # Proxy configuration
     env = os.environ.copy()

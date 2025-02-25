@@ -19,6 +19,7 @@ A debugging proxy that can log or intercept HTTPS requests. This tool can be use
 - Connection delays for testing
 - Concurrent connection support
 - Binary data handling
+- Automatic port selection
 
 ## Installation
 
@@ -52,7 +53,7 @@ The tool starts a proxy server and then runs the specified command with appropri
 ### Options
 
 - `--logfile FILE, -l FILE`: Write logs to FILE (default: stdout)
-- `--port PORT, -p PORT`: Listen on PORT (default: 8080)
+- `--port PORT, -p PORT`: Listen on PORT (default: auto-select)
 - `--keep-certs`: Keep certificates in current directory
 - `--delay TIME`: Add TIME seconds delay to each connection
 - `--return-code N, -r N`: Return status code N for all requests
@@ -79,6 +80,11 @@ Return custom response with headers and body:
               -- ./my_script.py
 ```
 
+Use specific port instead of auto-selection:
+```bash
+./proxyspy.py --port 8888 -- curl https://httpbin.org/ip
+```
+
 ## How It Works
 
 The proxy operates in two modes and can optionally add delays to any connection:
@@ -98,6 +104,11 @@ The proxy operates in two modes and can optionally add delays to any connection:
 - Delay occurs after connection but before SSL handshake
 - Useful for testing timeout and connection handling
 
+### Port Selection
+- By default, the proxy automatically selects an available port
+- This prevents socket reuse issues and allows running multiple instances
+- A specific port can be chosen with the --port option
+
 ## Development
 
 Run tests:
@@ -111,6 +122,7 @@ The test suite covers:
 - Binary data handling
 - Connection delays
 - Error conditions
+- Sequential proxy starts
 
 ## Contributing
 
@@ -124,4 +136,4 @@ When submitting pull requests, please:
 
 ## About This Project
 
-This project was primarily developed through a series of conversations with Claude 3.5 Sonnet, an AI assistant from Anthropic (https://claude.ai). The majority of the code, including the test suite and GitHub Actions configuration, was written by Claude in response to requirements and refinements from human developers. This collaborative approach demonstrates how AI assistance can help create well-tested, maintainable code while adhering to strict dependency and design constraints.
+This project was primarily developed through a series of conversations with Claude 3.5 and 3.7 Sonnet, an AI assistant from Anthropic (https://claude.ai). The majority of the code, including the test suite and GitHub Actions configuration, was written by Claude in response to requirements and refinements from human developers. This collaborative approach demonstrates how AI assistance can help create well-tested, maintainable code while adhering to strict dependency and design constraints.
