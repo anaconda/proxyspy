@@ -459,6 +459,69 @@ def test_intercept_headers(proxy, session):
     proxy.assert_intercepted()
 
 
+def test_intercept_pattern(proxy, session):
+    """Test that the proxy only intercepts requests matching the specified patterns."""
+    proxy.start_proxy(
+        "--return-code", "418",
+        "--return-header", "X-Test: Pattern Match",
+        "--return-data", '{"status": "intercepted by pattern"}',
+        "--intercept-pattern", "httpbin.org",
+        "--intercept-pattern", "example.com"
+    )
+
+    # Request 1: Should match first pattern
+    resp_match1 = session.get("https://httpbin.org/get")
+    assert resp_match1.status_code == 418
+    proxy.verify_header(resp_match1, "X-Test", "Pattern Match")
+    assert resp_match1.json() == {"status": "intercepted by pattern"}
+    
+    # Force refresh logs and verify first request
+    proxy.get_logs(force=True)
+    assert any("httpbin.org matches intercept pattern" in line for line in proxy.get_logs())
+    
+    # Request 2: Should match second pattern
+    resp_match2 = session.get("https://example.com/")
+    assert resp_match2.status_code == 418
+    proxy.verify_header(resp_match2, "X-Test", "Pattern Match")
+    assert resp_match2.json() == {"status": "intercepted by pattern"}
+    
+    # Force refresh logs and verify second request
+    proxy.get_logs(force=True)
+    assert any("example.com matches intercept pattern" in line for line in proxy.get_logs())
+    
+    # Request 3: Should not match any pattern
+    resp_nomatch = session.get("https://example.org/")
+    assert resp_nomatch.status_code == 200
+    assert "Example Domain" in resp_nomatch.text
+    
+    # Force refresh logs and verify third request
+    logs = proxy.get_logs(force=True)
+    assert any("example.org does not match any intercept patterns" in line for line in logs)
+    
+    # Check connections to verify SSL handshakes
+    connections = proxy.get_connections()
+    
+    # Helper function to check if a connection was intercepted or forwarded
+    def find_connection(domain):
+        for cid, lines in connections.items():
+            if any(domain in line for line in lines):
+                return lines
+        return None
+    
+    # Verify both matching connections were intercepted (client SSL but no server SSL)
+    for domain in ["httpbin.org", "example.com"]:
+        conn_lines = find_connection(domain)
+        assert conn_lines is not None, f"Connection for {domain} not found"
+        assert any("[C<>P] SSL handshake completed" in line for line in conn_lines)
+        assert not any("[P<>S] SSL handshake completed" in line for line in conn_lines)
+    
+    # Verify non-matching connection was forwarded (both client and server SSL)
+    nonmatch_lines = find_connection("example.org")
+    assert nonmatch_lines is not None, "Connection for example.org not found"
+    assert any("[C<>P] SSL handshake completed" in line for line in nonmatch_lines)
+    assert any("[P<>S] SSL handshake completed" in line for line in nonmatch_lines)
+
+
 def test_keep_certs(proxy, session):
     """Test that --keep-certs option keeps certificates in current directory."""
     # Start in a clean temp directory

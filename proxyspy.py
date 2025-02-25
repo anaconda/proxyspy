@@ -198,6 +198,7 @@ class MyHTTPServer(ThreadingHTTPServer):
         self.lock = Lock()
         # Interception settings
         self.intercept_mode = False
+        self.intercept_patterns = []
         self.return_code = 200  # Default if in intercept mode
         self.return_headers = []  # List of (name, value) tuples
         self.return_data = ""  # Response body
@@ -305,7 +306,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
             client = client_context.wrap_socket(self.connection, server_side=True)
             self._log("[C<>P] SSL handshake completed")
 
-            if self.server.intercept_mode:
+            should_intercept = self.server.intercept_mode
+            if should_intercept and self.server.intercept_patterns:
+                should_intercept = False
+                for pattern in self.server.intercept_patterns:
+                    if pattern in host:  # Simple substring matching
+                        self._log("Host %s matches intercept pattern %s", host, pattern)
+                        should_intercept = True
+                        break
+                if not should_intercept:
+                    self._log("Host %s does not match any intercept patterns, forwarding", host)
+
+            if should_intercept:
                 # Read the decrypted request
                 request = t_request = client.recv(BUFFER_SIZE)
                 data = (self.server.return_data or "").encode("utf-8")
@@ -459,6 +471,11 @@ def main():
         help="HTTP status code to return for all requests",
     )
     parser.add_argument(
+        "--intercept-pattern",
+        action="append",
+        help="Only intercept requests matching this pattern (e.g. 'conda.anaconda.org')",
+    )
+    parser.add_argument(
         "--return-header",
         action="append",
         help='Response header in format "Name: Value" (can be repeated)',
@@ -509,6 +526,7 @@ def main():
         server.intercept_mode = True
         server.return_code = args.return_code or 200
         server.return_data = args.return_data or ""
+        server.intercept_patterns = args.intercept_pattern or []
 
         # Parse headers
         server.return_headers = []
