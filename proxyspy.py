@@ -545,7 +545,7 @@ def main():
 
     # Proxy configuration
     env = os.environ.copy()
-    proxy_host = "http://localhost:%d" % args.port
+    proxy_host = "http://localhost:%d" % port
     env["HTTPS_PROXY"] = proxy_host
     env["https_proxy"] = proxy_host
     env["HTTP_PROXY"] = proxy_host
