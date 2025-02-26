@@ -92,7 +92,6 @@ Intercept only requests to specific domains:
               --intercept-pattern "anaconda.org" \
               --intercept-pattern "conda.io" \
               -- python conda_script.py
->>>>>>> 7b97ab6 (intercept only hosts that match one or more patterns)
 ```
 
 ## How It Works
