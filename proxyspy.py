@@ -88,6 +88,7 @@ def read_or_create_cert(host=None):
     global CA_KEY
 
     is_CA = host is None
+    logger.debug("Certificate requested for %s", host or "<CA>")
 
     assert CERT_DIR
     cert_path = join(CERT_DIR, "cert.pem" if is_CA else "%s-cert.pem" % host)
@@ -123,6 +124,7 @@ def read_or_create_cert(host=None):
         public_exponent=65537,
         key_size=2048,
     )
+    logger.debug("Private key generated")
     pub = key.public_key()
     if not host:
         CA_KEY = key
@@ -157,9 +159,11 @@ def read_or_create_cert(host=None):
         )
     else:
         cert = cert.add_extension(x509.SubjectAlternativeName([x509.DNSName(host)]), critical=False)
+    logger.debug("Certificate constructed")
 
     # Sign with CA key
     cert = cert.sign(CA_KEY, hashes.SHA256())
+    logger.debug("Certificate signed")
     if is_CA:
         CA_CERT = cert
 
@@ -176,6 +180,7 @@ def read_or_create_cert(host=None):
         f.write(key_pem)
     with open(cert_path, "wb") as f:
         f.write(cert_pem)
+    logger.debug("Certificates written to disk")
 
     return cert_path, key_path
 
@@ -198,7 +203,7 @@ class MyHTTPServer(ThreadingHTTPServer):
         self.lock = Lock()
         # Interception settings
         self.intercept_mode = False
-        self.intercept_patterns = []
+        self.intercept_hosts = []
         self.return_code = 200  # Default if in intercept mode
         self.return_headers = []  # List of (name, value) tuples
         self.return_data = ""  # Response body
@@ -307,15 +312,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._log("[C<>P] SSL handshake completed")
 
             should_intercept = self.server.intercept_mode
-            if should_intercept and self.server.intercept_patterns:
-                should_intercept = False
-                for pattern in self.server.intercept_patterns:
-                    if pattern in host:  # Simple substring matching
-                        self._log("Host %s matches intercept pattern %s", host, pattern)
-                        should_intercept = True
-                        break
-                if not should_intercept:
-                    self._log("Host %s does not match any intercept patterns, forwarding", host)
+            if should_intercept and self.server.intercept_hosts:
+                should_intercept = host in self.server.intercept_hosts
+                if should_intercept:
+                    self._log("Host %s found in intercept list" % host)
+                else:
+                    self._log("Host %s not found in intercept list, forwarding" % host)
 
             if should_intercept:
                 # Read the decrypted request
@@ -471,9 +473,14 @@ def main():
         help="HTTP status code to return for all requests",
     )
     parser.add_argument(
-        "--intercept-pattern",
+        "--intercept-host",
         action="append",
-        help="Only intercept requests matching this pattern (e.g. 'conda.anaconda.org')",
+        help="Only intercept requests from this host (e.g. 'conda.anaconda.org') (can be repeated)",
+    )
+    parser.add_argument(
+        "--prepare-host",
+        action="append",
+        help="Prepare the SSL certificate for this host in advance, to reduce the first connection delay (can be repeated)"
     )
     parser.add_argument(
         "--return-header",
@@ -481,12 +488,13 @@ def main():
         help='Response header in format "Name: Value" (can be repeated)',
     )
     parser.add_argument("--return-data", help="Response body to return")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("command", nargs="+", help="Command to run and its arguments")
     args = parser.parse_args()
 
     # Configure logging
     logging_config = {
-        "level": logging.INFO,
+        "level": logging.DEBUG if args.debug else logging.INFO,
         "format": LOG_FORMAT,
         "handlers": [],
     }
@@ -512,6 +520,8 @@ def main():
         atexit.register(cleanup)
     logger.info("Certificate directory: %s", CERT_DIR)
     cert_path, key_path = read_or_create_cert()
+    for host in set(args.intercept_host) | set(args.prepare_host):
+        read_or_create_cert(host)
 
     # Start and configure server
     port = args.port
@@ -526,7 +536,7 @@ def main():
         server.intercept_mode = True
         server.return_code = args.return_code or 200
         server.return_data = args.return_data or ""
-        server.intercept_patterns = args.intercept_pattern or []
+        server.intercept_hosts = args.intercept_host or []
 
         # Parse headers
         server.return_headers = []

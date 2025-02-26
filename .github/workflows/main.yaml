@@ -110,6 +110,11 @@ jobs:
         pip install "${wheel_file}[test]"
         pytest -v tests || pytest -v tests
 
+    - name: Example output for timing study
+      run: |
+        conda activate testconda
+        proxyspy --debug conda search --override-channels -c conda-forge proxyspy
+
   publish:
     needs: test
     runs-on: ubuntu-latest

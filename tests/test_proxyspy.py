@@ -76,7 +76,7 @@ class ProxyTestHarness:
             cmd.extend(("--port", "0"))
         cmd.extend(extra_args)
         # Long-running process to keep proxy alive
-        cmd.extend(("--", "sleep", "3600"))
+        cmd.extend(("--debug", "--", "sleep", "3600"))
         print(f"\nStarting proxy server: {' '.join(cmd)}")
         self.proxy_process = Popen(cmd)
         self.proxy_psutil = psutil.Process(self.proxy_process.pid)
@@ -459,35 +459,35 @@ def test_intercept_headers(proxy, session):
     proxy.assert_intercepted()
 
 
-def test_intercept_pattern(proxy, session):
+def test_intercept_hosts(proxy, session):
     """Test that the proxy only intercepts requests matching the specified patterns."""
     proxy.start_proxy(
         "--return-code", "418",
-        "--return-header", "X-Test: Pattern Match",
-        "--return-data", '{"status": "intercepted by pattern"}',
-        "--intercept-pattern", "httpbin.org",
-        "--intercept-pattern", "example.com"
+        "--return-header", "X-Test: Host Match",
+        "--return-data", '{"status": "intercepted by host list"}',
+        "--intercept-host", "httpbin.org",
+        "--intercept-host", "example.com"
     )
 
     # Request 1: Should match first pattern
     resp_match1 = session.get("https://httpbin.org/get")
     assert resp_match1.status_code == 418
-    proxy.verify_header(resp_match1, "X-Test", "Pattern Match")
-    assert resp_match1.json() == {"status": "intercepted by pattern"}
+    proxy.verify_header(resp_match1, "X-Test", "Host Match")
+    assert resp_match1.json() == {"status": "intercepted by host list"}
     
     # Force refresh logs and verify first request
     proxy.get_logs(force=True)
-    assert any("httpbin.org matches intercept pattern" in line for line in proxy.get_logs())
+    assert any("httpbin.org found in intercept list" in line for line in proxy.get_logs())
     
     # Request 2: Should match second pattern
     resp_match2 = session.get("https://example.com/")
     assert resp_match2.status_code == 418
-    proxy.verify_header(resp_match2, "X-Test", "Pattern Match")
-    assert resp_match2.json() == {"status": "intercepted by pattern"}
+    proxy.verify_header(resp_match2, "X-Test", "Host Match")
+    assert resp_match2.json() == {"status": "intercepted by host list"}
     
     # Force refresh logs and verify second request
     proxy.get_logs(force=True)
-    assert any("example.com matches intercept pattern" in line for line in proxy.get_logs())
+    assert any("example.com found in intercept list" in line for line in proxy.get_logs())
     
     # Request 3: Should not match any pattern
     resp_nomatch = session.get("https://example.org/")
@@ -496,7 +496,7 @@ def test_intercept_pattern(proxy, session):
     
     # Force refresh logs and verify third request
     logs = proxy.get_logs(force=True)
-    assert any("example.org does not match any intercept patterns" in line for line in logs)
+    assert any("example.org not found in intercept list" in line for line in logs)
     
     # Check connections to verify SSL handshakes
     connections = proxy.get_connections()
