@@ -59,7 +59,7 @@ The tool starts a proxy server and then runs the specified command with appropri
 - `--return-code N, -r N`: Return status code N for all requests
 - `--return-header H`: Add header H to responses (can repeat)
 - `--return-data DATA`: Return DATA as response body
-- `--intercept-pattern PATTERN`: Only intercept requests to hosts matching PATTERN (can repeat)
+- `--intercept-host HOST`: Only intercept requests to HOST (can repeat)
 
 ### Examples
 
@@ -89,8 +89,8 @@ Use specific port instead of auto-selection:
 Intercept only requests to specific domains:
 ```bash
 ./proxyspy.py --return-code 404 \
-              --intercept-pattern "anaconda.org" \
-              --intercept-pattern "conda.io" \
+              --intercept-host "conda.anaconda.org" \
+              --intercept-host "repo.anaconda.com" \
               -- python conda_script.py
 ```
 
