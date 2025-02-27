@@ -58,7 +58,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 # Modified by our pre-commit hook
-__version__ = "0.1.1.post4"
+__version__ = "0.1.2.post3"
 
 # _forward_data buffer size
 BUFFER_SIZE = 65536
@@ -88,7 +88,11 @@ def read_or_create_cert(host=None):
     global CA_KEY
 
     is_CA = host is None
-    logger.debug("Certificate requested for %s", host or "<CA>")
+    if is_CA:
+        logger.info("Requested CA certificate")
+    else:
+        assert CA_CERT and CA_KEY
+        logger.info("Requested certificate for %s", host)
 
     assert CERT_DIR
     cert_path = join(CERT_DIR, "cert.pem" if is_CA else "%s-cert.pem" % host)
@@ -106,12 +110,7 @@ def read_or_create_cert(host=None):
             logger.info("Using existing host certificate for %s", host)
             CERT_READ.add(host)
         return cert_path, key_path
-
-    if is_CA:
-        logger.info("Generating CA certificate")
-    else:
-        assert CA_CERT and CA_KEY
-        logger.info("Generating host certificate for %s", host)
+    logger.debug("Certificate not cached; generating")
 
     # Generate CSR-like data
     hostname = "Debug Proxy CA" if is_CA else host
@@ -119,13 +118,15 @@ def read_or_create_cert(host=None):
     if is_CA:
         host_info.append(x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Debug Proxy"))
     name = x509.Name(host_info)
+    logger.debug("Name generated")
 
     key = rsa.generate_private_key(
         public_exponent=65537,
         key_size=2048,
     )
-    logger.debug("Private key generated")
     pub = key.public_key()
+    logger.debug("Private key generated")
+
     if not host:
         CA_KEY = key
     cert = (
@@ -180,7 +181,7 @@ def read_or_create_cert(host=None):
         f.write(key_pem)
     with open(cert_path, "wb") as f:
         f.write(cert_pem)
-    logger.debug("Certificates written to disk")
+    logger.debug("Certificate written to disk")
 
     return cert_path, key_path
 
@@ -480,7 +481,8 @@ def main():
     parser.add_argument(
         "--prepare-host",
         action="append",
-        help="Prepare the SSL certificate for this host in advance, to reduce the first connection delay (can be repeated)"
+        help="Prepare the SSL certificate for this host in advance, to reduce the "
+        "first connection delay (can be repeated)",
     )
     parser.add_argument(
         "--return-header",
@@ -520,7 +522,7 @@ def main():
         atexit.register(cleanup)
     logger.info("Certificate directory: %s", CERT_DIR)
     cert_path, key_path = read_or_create_cert()
-    for host in set(args.intercept_host) | set(args.prepare_host):
+    for host in set(args.intercept_host or ()) | set(args.prepare_host or ()):
         read_or_create_cert(host)
 
     # Start and configure server
@@ -568,6 +570,7 @@ def main():
     env["SSL_CERT_FILE"] = cert_path
     env["REQUESTS_CA_BUNDLE"] = cert_path
     env["CONDA_SSL_VERIFY"] = cert_path
+    logger.info("CA environment variable value: %s", cert_path)
 
     # Run child process
     returncode = 0

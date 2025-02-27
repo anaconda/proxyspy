@@ -113,7 +113,7 @@ jobs:
     - name: Example output for timing study
       run: |
         conda activate testconda
-        proxyspy --debug conda search --override-channels -c conda-forge proxyspy
+        proxyspy --debug -- python -c 'import urllib.request; urllib.request.urlopen("https://httpbin.org")'
 
   publish:
     needs: test

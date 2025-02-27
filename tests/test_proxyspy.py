@@ -364,6 +364,21 @@ def test_forwarding_response_body(proxy, session):
     assert len(response.content) == 1024
 
 
+def test_prepare_hosts(proxy):
+    proxy.start_proxy(
+        "--intercept-host",
+        "example.org",
+        "--intercept-host",
+        "example.com",
+        "--prepare-host",
+        "httpbin.org",
+        "--prepare-host",
+        "httpbin.com",
+    )
+    for host in ("example.org", "example.com", "httpbin.org", "httpbin.com"):
+        proxy.assert_log_contains("Requested certificate for " + host)
+
+
 def test_intercept_response_body(proxy, session):
     """Test that intercepted responses handle response bodies correctly."""
     # Create a response body with various challenging content
@@ -462,11 +477,16 @@ def test_intercept_headers(proxy, session):
 def test_intercept_hosts(proxy, session):
     """Test that the proxy only intercepts requests matching the specified patterns."""
     proxy.start_proxy(
-        "--return-code", "418",
-        "--return-header", "X-Test: Host Match",
-        "--return-data", '{"status": "intercepted by host list"}',
-        "--intercept-host", "httpbin.org",
-        "--intercept-host", "example.com"
+        "--return-code",
+        "418",
+        "--return-header",
+        "X-Test: Host Match",
+        "--return-data",
+        '{"status": "intercepted by host list"}',
+        "--intercept-host",
+        "httpbin.org",
+        "--intercept-host",
+        "example.com",
     )
 
     # Request 1: Should match first pattern
@@ -474,47 +494,47 @@ def test_intercept_hosts(proxy, session):
     assert resp_match1.status_code == 418
     proxy.verify_header(resp_match1, "X-Test", "Host Match")
     assert resp_match1.json() == {"status": "intercepted by host list"}
-    
+
     # Force refresh logs and verify first request
     proxy.get_logs(force=True)
     assert any("httpbin.org found in intercept list" in line for line in proxy.get_logs())
-    
+
     # Request 2: Should match second pattern
     resp_match2 = session.get("https://example.com/")
     assert resp_match2.status_code == 418
     proxy.verify_header(resp_match2, "X-Test", "Host Match")
     assert resp_match2.json() == {"status": "intercepted by host list"}
-    
+
     # Force refresh logs and verify second request
     proxy.get_logs(force=True)
     assert any("example.com found in intercept list" in line for line in proxy.get_logs())
-    
+
     # Request 3: Should not match any pattern
     resp_nomatch = session.get("https://example.org/")
     assert resp_nomatch.status_code == 200
     assert "Example Domain" in resp_nomatch.text
-    
+
     # Force refresh logs and verify third request
     logs = proxy.get_logs(force=True)
     assert any("example.org not found in intercept list" in line for line in logs)
-    
+
     # Check connections to verify SSL handshakes
     connections = proxy.get_connections()
-    
+
     # Helper function to check if a connection was intercepted or forwarded
     def find_connection(domain):
         for cid, lines in connections.items():
             if any(domain in line for line in lines):
                 return lines
         return None
-    
+
     # Verify both matching connections were intercepted (client SSL but no server SSL)
     for domain in ["httpbin.org", "example.com"]:
         conn_lines = find_connection(domain)
         assert conn_lines is not None, f"Connection for {domain} not found"
         assert any("[C<>P] SSL handshake completed" in line for line in conn_lines)
         assert not any("[P<>S] SSL handshake completed" in line for line in conn_lines)
-    
+
     # Verify non-matching connection was forwarded (both client and server SSL)
     nonmatch_lines = find_connection("example.org")
     assert nonmatch_lines is not None, "Connection for example.org not found"
