@@ -113,6 +113,7 @@ jobs:
     - name: Example output for timing study
       run: |
         conda activate testconda
+        if [ ${{ matrix.os }} != windows-latest ]; then lscpu; fi
         proxyspy --debug --return-code 200 --return-data "hello" -- \
           python -c 'import urllib.request; urllib.request.urlopen("https://httpbin.org")'
 
