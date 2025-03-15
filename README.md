@@ -27,7 +27,7 @@ A debugging proxy that can log or intercept HTTPS requests. This tool can be use
 ProxySpy is available on both Conda-Forge and PyPi:
 
 ```bash
-conda install conda-forge::proxyspy
+conda install conda-forge::proxyspy  # or...
 pip install proxyspy
 ```
 
