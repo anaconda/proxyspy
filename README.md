@@ -65,7 +65,7 @@ The tool starts a proxy server and then runs the specified command with appropri
 
 Log all HTTPS requests to test.log:
 ```bash
-./proxyspy.py --logfile test.log -- curl https://httpbin.org/ip
+./proxyspy.py --logfile test.log -- curl https://httpbingo.org/ip
 ```
 
 Return 404 for all requests with a half-second delay:
@@ -83,7 +83,7 @@ Return custom response with headers and body:
 
 Use specific port instead of auto-selection:
 ```bash
-./proxyspy.py --port 8888 -- curl https://httpbin.org/ip
+./proxyspy.py --port 8888 -- curl https://httpbingo.org/ip
 ```
 
 Intercept only requests to specific domains:

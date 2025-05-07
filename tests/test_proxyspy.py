@@ -282,11 +282,11 @@ def test_error_wrong_port(proxy, session):
     proxy.start_proxy()
 
     with pytest.raises(EXCEPTIONS):
-        # Port 81 is usually not running on httpbin.org
-        session.get("https://httpbin.org:81/get", timeout=2.0)
+        # Port 81 is usually not running on httpbingo.org
+        session.get("https://httpbingo.org:81/get", timeout=2.0)
 
     # Should see connection establishment but then timeout
-    proxy.assert_log_contains("[C->P] CONNECT httpbin.org:81")
+    proxy.assert_log_contains("[C->P] CONNECT httpbingo.org:81")
     proxy.assert_log_contains("[P->C] HTTP/1.0 200 Connection Established")
     proxy.assert_log_contains("[C<>P] SSL handshake completed")
     # Note: We don't see 'Connection closed' because the timeout doesn't trigger a clean closure
@@ -335,7 +335,7 @@ def test_proxy_intercept(proxy, session):
     )
 
     # Make a request through the proxy - environment variables handle all config
-    resp = session.get("https://httpbin.org/get")
+    resp = session.get("https://httpbingo.org/get")
 
     # Verify response was intercepted
     assert resp.status_code == 418
@@ -351,14 +351,14 @@ def test_forwarding_response_body(proxy, session):
 
     # Try bytes endpoint first with small payload
     print("\nTesting small binary response")
-    response = session.get("https://httpbin.org/bytes/64")
+    response = session.get("https://httpbingo.org/bytes/64")
     assert response.status_code == 200
     assert len(response.content) == 64
     print("Successfully received 64 bytes")
 
     # Now try the larger response
     print("\nTesting 1KB binary response")
-    response = session.get("https://httpbin.org/bytes/1024")
+    response = session.get("https://httpbingo.org/bytes/1024")
     assert response.status_code == 200
     print(f"Received {len(response.content)} bytes")
     assert len(response.content) == 1024
@@ -371,11 +371,11 @@ def test_prepare_hosts(proxy):
         "--intercept-host",
         "example.com",
         "--prepare-host",
-        "httpbin.org",
+        "httpbingo.org",
         "--prepare-host",
         "httpbin.com",
     )
-    for host in ("example.org", "example.com", "httpbin.org", "httpbin.com"):
+    for host in ("example.org", "example.com", "httpbingo.org", "httpbin.com"):
         proxy.assert_log_contains("Requested certificate for " + host)
 
 
@@ -405,7 +405,7 @@ def test_intercept_response_body(proxy, session):
         test_body,
     )
 
-    response = session.get("https://httpbin.org/get")
+    response = session.get("https://httpbingo.org/get")
 
     # Basic response verification
     assert response.status_code == 200
@@ -450,7 +450,7 @@ def test_intercept_headers(proxy, session):
         '{"status": "ok"}',
     )
 
-    response = session.get("https://httpbin.org/get")
+    response = session.get("https://httpbingo.org/get")
 
     # Basic response verification
     assert response.status_code == 200
@@ -484,20 +484,20 @@ def test_intercept_hosts(proxy, session):
         "--return-data",
         '{"status": "intercepted by host list"}',
         "--intercept-host",
-        "httpbin.org",
+        "httpbingo.org",
         "--intercept-host",
         "example.com",
     )
 
     # Request 1: Should match first pattern
-    resp_match1 = session.get("https://httpbin.org/get")
+    resp_match1 = session.get("https://httpbingo.org/get")
     assert resp_match1.status_code == 418
     proxy.verify_header(resp_match1, "X-Test", "Host Match")
     assert resp_match1.json() == {"status": "intercepted by host list"}
 
     # Force refresh logs and verify first request
     proxy.get_logs(force=True)
-    assert any("httpbin.org found in intercept list" in line for line in proxy.get_logs())
+    assert any("httpbingo.org found in intercept list" in line for line in proxy.get_logs())
 
     # Request 2: Should match second pattern
     resp_match2 = session.get("https://example.com/")
@@ -529,7 +529,7 @@ def test_intercept_hosts(proxy, session):
         return None
 
     # Verify both matching connections were intercepted (client SSL but no server SSL)
-    for domain in ["httpbin.org", "example.com"]:
+    for domain in ["httpbingo.org", "example.com"]:
         conn_lines = find_connection(domain)
         assert conn_lines is not None, f"Connection for {domain} not found"
         assert any("[C<>P] SSL handshake completed" in line for line in conn_lines)
@@ -560,11 +560,11 @@ def test_keep_certs(proxy, session):
         assert ca_cert.exists(), "CA certificate not found"
         assert ca_key.exists(), "CA key not found"
 
-        session.get("https://httpbin.org/get")
+        session.get("https://httpbingo.org/get")
 
         # Verify host cert files exist
-        host_cert = Path("httpbin.org-cert.pem")
-        host_key = Path("httpbin.org-key.pem")
+        host_cert = Path("httpbingo.org-cert.pem")
+        host_key = Path("httpbingo.org-key.pem")
         assert host_cert.exists(), "Host certificate not found"
         assert host_key.exists(), "Host key not found"
 
@@ -587,7 +587,7 @@ def test_proxy_delay(proxy, session):
     proxy.start_proxy("--delay", str(delay), "--return-code", str(200))
 
     # Make a request through the proxy using environment settings
-    resp = session.get("https://httpbin.org/get")
+    resp = session.get("https://httpbingo.org/get")
     assert resp.status_code == 200
 
     # Check logs for delay enforcement
@@ -623,7 +623,7 @@ def test_concurrent_connections(proxy):
 
     def make_request(i):
         # Create session with retry strategy
-        url = f"https://httpbin.org/get?ndx={i}"
+        url = f"https://httpbingo.org/get?ndx={i}"
         try:
             resp = _get_session().get(url, timeout=5.0)
             return resp.status_code, i
@@ -679,7 +679,7 @@ def test_sequential_proxy_starts(tmp_path):
             # Make a simple request to ensure proxy is working
             session = _get_session()
             try:
-                response = session.get("https://httpbin.org/get", timeout=2.0)
+                response = session.get("https://httpbingo.org/get", timeout=2.0)
                 assert response.status_code == 404, "Expected 404 response"
                 print(f"Request test passed with status {response.status_code}")
             except requests.exceptions.RequestException as e:
