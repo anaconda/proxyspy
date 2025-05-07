@@ -6,6 +6,7 @@
 [![Conda Version](https://img.shields.io/conda/v/mcg/proxyspy)](https://anaconda.org/mcg/proxyspy)
 
 A debugging proxy that can log or intercept HTTPS requests. This tool can be used to:
+
 - Monitor HTTPS traffic from applications
 - Debug SSL/TLS issues
 - Test applications against specific HTTP responses
@@ -23,16 +24,35 @@ A debugging proxy that can log or intercept HTTPS requests. This tool can be use
 
 ## Installation
 
-The proxy is distributed as a single Python file `proxyspy.py`. To use it in your project:
+ProxySpy is available on both Conda-Forge and PyPi:
 
-1. Copy `proxyspy.py` into your repository
-2. Ensure the `cryptography` package is available in your Python environment
+```bash
+conda install conda-forge::proxyspy  # or...
+pip install proxyspy
+```
 
-That's it! The script is self-contained and ready to use.
+Installing it this way ensures that its `cryptography` dependency is also
+available, and add the `proxyspy` command to your `PATH` when this Python
+environment is activated.
+
+This utility has been deliberately designed to function as a single-file
+Python script that depends only upon the standard Python 3 library and the
+`cryptography` package. For that reason, you can also vendor the script
+directly into your work environment if you wish.
+
+1. Copy `proxyspy.py` directly into your project.
+   [Here](https://raw.githubusercontent.com/anaconda/proxyspy/refs/heads/main/proxyspy.py)
+   is a direct download link to the latest version of the script.
+2. Ensure the `cryptography` package is available in your Python environment:
+   ```
+   conda install cryptography  # or...
+   pip install cryptography
+   ```
 
 ## Development Requirements
 
 To develop or test the proxy itself, additional packages are required:
+
 ```bash
 conda install --file requirements.txt
 ```
@@ -45,7 +65,8 @@ This will install:
 ## Usage
 
 ```bash
-./proxyspy.py [options] -- command [args...]
+proxyspy [options] -- command [args...]            # Installed as a package
+python proxyspy.py [options] -- command [args...]  # Direct access
 ```
 
 The tool starts a proxy server and then runs the specified command with appropriate proxy environment variables set.
@@ -64,34 +85,39 @@ The tool starts a proxy server and then runs the specified command with appropri
 ### Examples
 
 Log all HTTPS requests to test.log:
+
 ```bash
-./proxyspy.py --logfile test.log -- curl https://httpbingo.org/ip
+proxyspy --logfile test.log -- curl https://httpbingo.org/ip
 ```
 
 Return 404 for all requests with a half-second delay:
+
 ```bash
-./proxyspy.py --return-code 404 --delay 0.5 -- python my_script.py
+proxyspy --return-code 404 --delay 0.5 -- python my_script.py
 ```
 
 Return custom response with headers and body:
+
 ```bash
-./proxyspy.py --return-code 200 \
-              --return-header "Content-Type: application/json" \
-              --return-data '{"status": "ok"}' \
-              -- ./my_script.py
+proxyspy --return-code 200 \
+         --return-header "Content-Type: application/json" \
+         --return-data '{"status": "ok"}' \
+         -- ./my_script.py
 ```
 
 Use specific port instead of auto-selection:
+
 ```bash
-./proxyspy.py --port 8888 -- curl https://httpbingo.org/ip
+proxyspy.py --port 8888 -- curl https://httpbingo.org/ip
 ```
 
 Intercept only requests to specific domains:
+
 ```bash
-./proxyspy.py --return-code 404 \
-              --intercept-host "conda.anaconda.org" \
-              --intercept-host "repo.anaconda.com" \
-              -- python conda_script.py
+proxyspy --return-code 404 \
+         --intercept-host "conda.anaconda.org" \
+         --intercept-host "repo.anaconda.com" \
+         -- python conda_script.py
 ```
 
 ## How It Works
