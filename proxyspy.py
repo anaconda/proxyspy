@@ -23,7 +23,7 @@ Arguments:
 
 Examples:
     # Log all HTTPS requests to test.log:
-    ./proxyspy.py --logfile test.log -- curl https://httpbin.org/ip
+    ./proxyspy.py --logfile test.log -- curl https://httpbingo.org/ip
 
     # Return 404 for all requests, but with a half-second delay:
     ./proxyspy.py --return-code 404 --delay 0.5 -- python my_script.py

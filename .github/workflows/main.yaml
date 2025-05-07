@@ -31,7 +31,7 @@ jobs:
         # minimal use of pip. By installing twine via conda first then
         # pip we're getting all of its dependencies via conda.
         conda update --all
-        conda install conda-build hatchling twine
+        conda install conda-forge::conda-build hatchling twine
         conda remove twine --force
         pip install twine
 
@@ -114,7 +114,7 @@ jobs:
       run: |
         conda activate testconda
         proxyspy --debug --return-code 200 --return-data "hello" -- \
-          python -c 'import urllib.request; urllib.request.urlopen("https://httpbin.org")'
+          python -c 'import urllib.request; urllib.request.urlopen("https://httpbingo.org")'
 
   publish:
     needs: test
