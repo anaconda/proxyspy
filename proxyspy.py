@@ -159,7 +159,13 @@ def read_or_create_cert(host=None):
             critical=False,
         )
     else:
-        cert = cert.add_extension(x509.SubjectAlternativeName([x509.DNSName(host)]), critical=False)
+        cert = cert.add_extension(
+            x509.SubjectAlternativeName([x509.DNSName(host)]), 
+            critical=False
+        ).add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(CA_KEY.public_key()),
+            critical=False,
+        )
     logger.debug("Certificate constructed")
 
     # Sign with CA key
