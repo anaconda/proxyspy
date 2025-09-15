@@ -55,10 +55,10 @@ from threading import Lock, Thread
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.x509.oid import NameOID
+from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
 
 # Modified by our pre-commit hook
-__version__ = "0.1.2.post3"
+__version__ = "0.1.4"
 
 # _forward_data buffer size
 BUFFER_SIZE = 65536
@@ -138,30 +138,35 @@ def read_or_create_cert(host=None):
         .not_valid_before(datetime.now())
         .not_valid_after(datetime.now() + timedelta(days=365))
         .add_extension(x509.BasicConstraints(ca=is_CA, path_length=None), critical=True)
-    )
-    if is_CA:
-        # Enable certificate signing
-        cert = cert.add_extension(
+        .add_extension(
             x509.KeyUsage(
                 digital_signature=True,
                 content_commitment=False,
                 key_encipherment=True,
                 data_encipherment=False,
                 key_agreement=False,
-                key_cert_sign=True,
-                crl_sign=True,
+                key_cert_sign=is_CA,    # True for CA, False for host
+                crl_sign=is_CA,         # True for CA, False for host
                 encipher_only=False,
                 decipher_only=False,
             ),
             critical=True,
-        ).add_extension(
+        )
+    )
+    if is_CA:
+        # Enable certificate signing
+        cert = cert.add_extension(
             x509.SubjectKeyIdentifier.from_public_key(pub),
             critical=False,
         )
     else:
+        # Host-specific extensions
         cert = cert.add_extension(
             x509.SubjectAlternativeName([x509.DNSName(host)]), 
             critical=False
+        ).add_extension(
+            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]),
+            critical=True,
         ).add_extension(
             x509.AuthorityKeyIdentifier.from_issuer_public_key(CA_KEY.public_key()),
             critical=False,
