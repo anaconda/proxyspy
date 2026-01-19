@@ -23,6 +23,7 @@ jobs:
       with:
         activate-environment: ""
         auto-activate-base: true
+        channels: defaults
 
     - name: Install build packages
       run: |
@@ -80,6 +81,7 @@ jobs:
       with:
         activate-environment: ""
         auto-activate-base: true
+        channels: defaults
 
     - name: Download built packages
       uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
@@ -165,6 +167,7 @@ jobs:
       with:
         activate-environment: ""
         auto-activate-base: true
+        channels: defaults
 
     - name: Install publishing packages
       run: |
