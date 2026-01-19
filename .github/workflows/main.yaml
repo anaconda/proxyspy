@@ -23,6 +23,7 @@ jobs:
       with:
         activate-environment: ""
         auto-activate-base: true
+        channels: defaults
 
     - name: Install build packages
       run: |
@@ -54,7 +55,7 @@ jobs:
         find dist
 
     - name: Upload packages
-      uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
       with:
         name: packages
         path: dist
@@ -68,7 +69,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-13, macos-14, windows-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
     runs-on: ${{ matrix.os }}
 
@@ -80,9 +81,10 @@ jobs:
       with:
         activate-environment: ""
         auto-activate-base: true
+        channels: defaults
 
     - name: Download built packages
-      uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+      uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
       with:
         name: packages
         path: dist
@@ -155,7 +157,7 @@ jobs:
         fi
 
     - name: Download built packages
-      uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+      uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
       with:
         name: packages
         path: dist
@@ -165,6 +167,7 @@ jobs:
       with:
         activate-environment: ""
         auto-activate-base: true
+        channels: defaults
 
     - name: Install publishing packages
       run: |
