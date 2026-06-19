@@ -1,6 +1,7 @@
 import os
 import shutil
 import socket
+import ssl
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -690,3 +691,170 @@ def test_sequential_proxy_starts(tmp_path):
     # Verify we got different ports
     print(f"Ports used: {ports_used}")
     assert len(set(ports_used)) > 1, "Auto-port selection didn't rotate ports"
+
+
+#
+# Reverse / transparent mode
+#
+
+
+class ReverseHarness:
+    """Lifecycle manager for a standalone (--reverse) proxyspy instance.
+
+    Unlike ProxyTestHarness, reverse mode has no child command and uses a
+    persistent --cert-dir, so this launches proxyspy directly and parses the
+    auto-selected listen port from the log.
+    """
+
+    def __init__(self, tmp_path):
+        self.tmp_path = tmp_path
+        self.cert_dir = tmp_path / "certs"
+        self.log_file = tmp_path / "reverse.log"
+        self.script_path = find_proxyspy()
+        self.process = None
+        self.port = None
+
+    def start(self, *extra_args, expect_exit=False):
+        if isinstance(self.script_path, Path) or str(self.script_path).endswith(".py"):
+            cmd = ["python", str(self.script_path)]
+        else:
+            cmd = [str(self.script_path)]
+        cmd += [
+            "--reverse",
+            "--port",
+            "0",
+            "--cert-dir",
+            str(self.cert_dir),
+            "--logfile",
+            str(self.log_file),
+            "--debug",
+        ]
+        cmd += list(extra_args)
+        print(f"\nStarting reverse proxy: {' '.join(cmd)}")
+        self.process = Popen(cmd)
+
+        # When we expect a clean startup, wait for the listening line and port.
+        if expect_exit:
+            self.process.wait(timeout=10)
+            return
+        start_time = time.time()
+        while time.time() - start_time < 10:
+            if self.process.poll() is not None:
+                raise RuntimeError("Reverse proxy exited during startup")
+            if self.log_file.exists():
+                for line in self.log_file.read_text().splitlines():
+                    if "Reverse proxy listening on 127.0.0.1:" in line:
+                        self.port = int(line.rsplit(":", 1)[1])
+                        return
+            time.sleep(0.1)
+        raise RuntimeError("Reverse proxy failed to start within 10 seconds")
+
+    @property
+    def ca_path(self):
+        return str(self.cert_dir / "cert.pem")
+
+    def connect(self, host, verify=True):
+        """Open a TLS connection to the proxy with the given SNI host."""
+        if verify:
+            ctx = ssl.create_default_context(cafile=self.ca_path)
+        else:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        raw = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+        return ctx.wrap_socket(raw, server_hostname=host)
+
+    def logs(self):
+        return self.log_file.read_text() if self.log_file.exists() else ""
+
+    def stop(self):
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except Exception:
+                self.process.kill()
+                self.process.wait()
+
+
+@pytest.fixture
+def reverse(tmp_path):
+    harness = ReverseHarness(tmp_path)
+    try:
+        yield harness
+    finally:
+        harness.stop()
+
+
+def test_reverse_intercept(reverse):
+    """Reverse mode returns canned responses, selecting the cert via SNI,
+    without ever contacting a real upstream."""
+    reverse.start(
+        "--intercept-host",
+        "example.com",
+        "--return-code",
+        "418",
+        "--return-header",
+        "X-Test: reverse",
+        "--return-data",
+        "teapot",
+    )
+
+    sock = reverse.connect("example.com")
+    sock.sendall(b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+    response = b""
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        response += chunk
+    sock.close()
+
+    text = response.decode("iso-8859-1")
+    assert "418 Intercepted" in text
+    assert "X-Test: reverse" in text
+    assert text.endswith("teapot")
+
+    logs = reverse.logs()
+    # Cert chosen via SNI, request intercepted, no upstream handshake.
+    assert "SSL handshake completed (SNI: example.com)" in logs
+    assert "example.com found in intercept list" in logs
+    assert "[P<>S] SSL handshake completed" not in logs
+
+
+def test_reverse_forward(reverse):
+    """Reverse mode resolves the real upstream at startup and forwards a live
+    request, MITMing both ends."""
+    reverse.start("--prepare-host", "httpbingo.org")
+
+    logs = reverse.logs()
+    assert "Upstream for httpbingo.org ->" in logs, "Upstream was not resolved at startup"
+
+    sock = reverse.connect("httpbingo.org")
+    sock.sendall(b"GET /get HTTP/1.1\r\nHost: httpbingo.org\r\nConnection: close\r\n\r\n")
+    response = b""
+    while True:
+        try:
+            chunk = sock.recv(4096)
+        except (OSError, ssl.SSLError):
+            break
+        if not chunk:
+            break
+        response += chunk
+    sock.close()
+
+    # A real upstream response came back (status code varies with rate limits,
+    # so just assert a well-formed HTTP status line rather than pinning 200).
+    assert response.split(b"\r\n", 1)[0].startswith(b"HTTP/1.1 ")
+    logs = reverse.logs()
+    assert "SSL handshake completed (SNI: httpbingo.org)" in logs
+    assert "[P<>S] SSL handshake completed" in logs
+
+
+def test_reverse_loopback_guard(reverse):
+    """A host already resolving to loopback must abort startup with a clear
+    error rather than forwarding into the proxy itself."""
+    reverse.start("--prepare-host", "localhost", expect_exit=True)
+
+    assert reverse.process.returncode == 1
+    assert "loopback address" in reverse.logs()

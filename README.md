@@ -81,6 +81,11 @@ The tool starts a proxy server and then runs the specified command with appropri
 - `--return-header H`: Add header H to responses (can repeat)
 - `--return-data DATA`: Return DATA as response body
 - `--intercept-host HOST`: Only intercept requests to HOST (can repeat)
+- `--prepare-host HOST`: Pre-generate the certificate for HOST to avoid first-connection delay (can repeat)
+- `--reverse`: Run as a standalone reverse/transparent proxy instead of running a command (see below)
+- `--cert-dir DIR`: Directory for the persistent CA and host certificates (reverse mode default: `~/.proxyspy`)
+- `--map HOST=IP`: Pin the real upstream IP for HOST, bypassing DNS (reverse mode; can repeat)
+- `--upstream-port PORT`: Port to dial on the real upstream servers in reverse mode (default: 443)
 
 ### Examples
 
@@ -143,6 +148,32 @@ The proxy operates in two modes and can optionally add delays to any connection:
 - By default, the proxy automatically selects an available port
 - This prevents socket reuse issues and allows running multiple instances
 - A specific port can be chosen with the --port option
+
+## Reverse / Transparent Mode
+
+Forward mode requires a client that honors the `HTTPS_PROXY` environment variable. Many tools ignore proxy settings. For those, `--reverse` runs proxyspy as a standalone transparent MITM: it listens on `127.0.0.1` (default port 443) and learns the target hostname from the TLS SNI field. You redirect the hostnames you want to watch to `127.0.0.1` in `/etc/hosts`, and the client connects to proxyspy without knowing a proxy exists.
+
+Because `/etc/hosts` redirects the target hostnames to proxyspy itself, proxyspy cannot use the OS resolver to reach the real upstream once those entries are in place. It therefore resolves and caches each declared host's real IP **at startup** — so you must start proxyspy *before* editing `/etc/hosts`. If a declared host already resolves to a loopback address, proxyspy refuses to start and tells you to remove it from `/etc/hosts` or pin it with `--map HOST=IP`.
+
+Workflow:
+
+* Start proxyspy as root (port 443 is privileged), declaring the hosts to watch with `--prepare-host` (forward+log) or `--intercept-host` (return canned responses):
+  ```bash
+  sudo proxyspy --reverse --prepare-host repo.anaconda.com -l spy.log
+  ```
+* Trust the CA certificate it prints (default `~/.proxyspy/cert.pem`) in your client/system trust store. The CA persists across runs, so you only trust it once.
+* Add the redirects to `/etc/hosts`:
+  ```
+  127.0.0.1 repo.anaconda.com
+  ```
+* Run your client normally and watch `spy.log`.
+* Press Ctrl-C to stop proxyspy, then remove the `/etc/hosts` entries.
+
+Notes:
+
+* `--cert-dir` overrides where the persistent CA and host certificates live. Under `sudo`, the default `~/.proxyspy` resolves to the invoking user's home (via `SUDO_USER`), not root's.
+* `--map HOST=IP` pins an upstream IP, bypassing startup resolution. Use it when a host is already in `/etc/hosts`, or to target a specific backend.
+* A host listed only in `--intercept-host` (with no forwarding) never connects upstream, so it is not resolved.
 
 ## Development
 

@@ -6,20 +6,36 @@
 
 """HTTPS debugging proxy that logs or intercepts HTTPS requests.
 
-Launches a proxy server that either forwards HTTPS requests while logging
-headers and content, or intercepts requests and returns specified responses.
-Manages certificates automatically and supports concurrent connections.
-The script relies on the cryptography library to generate SSL certificates
-for the proxy, but deliberately avoids other third-party dependencies.
+Runs in one of two modes:
+
+* Forward mode (default): launches a proxy server and runs a command with the
+  proxy environment variables set, forwarding HTTPS requests while logging
+  headers and content, or intercepting requests and returning specified
+  responses.
+* Reverse mode (--reverse): runs standalone, listening on 127.0.0.1 (default
+  port 443) and reading the target host from the TLS SNI field. Point the
+  target hostnames at 127.0.0.1 in /etc/hosts to monitor clients that ignore
+  proxy environment variables. Start proxyspy *before* editing /etc/hosts so it
+  can resolve the real upstream addresses while DNS is still clean.
+
+Manages certificates automatically and supports concurrent connections. The
+script relies on the cryptography library to generate SSL certificates for the
+proxy, but deliberately avoids other third-party dependencies.
 
 Arguments:
     --logfile, -l FILE    Write logs to FILE instead of stdout
-    --port, -p PORT       Listen on PORT (default: 8080)
+    --port, -p PORT       Listen on PORT (default: auto-select; 443 in reverse)
     --keep-certs          Keep certificates in current directory
     --delay TIME          Emulate a connection delay of TIME seconds
     --return-code, -r N   Return status code N for all requests
     --return-header H     Add header H to responses (can repeat)
     --return-data DATA    Return DATA as response body
+    --intercept-host HOST Only intercept requests to HOST (can repeat)
+    --prepare-host HOST   Pre-generate the certificate for HOST (can repeat)
+    --reverse             Standalone reverse/transparent proxy (no command)
+    --cert-dir DIR        Persistent certificate directory (reverse: ~/.proxyspy)
+    --map HOST=IP         Pin the real upstream IP for HOST (reverse; can repeat)
+    --upstream-port PORT  Upstream port to dial in reverse mode (default: 443)
 
 Examples:
     # Log all HTTPS requests to test.log:
@@ -33,21 +49,28 @@ Examples:
                   --return-header "Content-Type: application/json" \\
                   --return-data '{"status": "ok"}' \\
                   -- ./my_script.py
+
+    # Standalone reverse proxy monitoring conda traffic (run as root for 443):
+    #   1. sudo ./proxyspy.py --reverse --prepare-host repo.anaconda.com -l spy.log
+    #   2. trust ~/.proxyspy/cert.pem, then add "127.0.0.1 repo.anaconda.com"
+    #      to /etc/hosts and run your client; Ctrl-C and revert /etc/hosts after
 """
 
 import argparse
 import atexit
+import ipaddress
 import logging
 import os
 import select
 import shutil
 import socket
+import socketserver
 import ssl
 import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from os.path import isfile, join
 from threading import Lock, Thread
@@ -55,10 +78,10 @@ from threading import Lock, Thread
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 # Modified by our pre-commit hook
-__version__ = "0.1.4"
+__version__ = "0.1.5.post20"
 
 # _forward_data buffer size
 BUFFER_SIZE = 65536
@@ -135,8 +158,11 @@ def read_or_create_cert(host=None):
         .issuer_name(name if is_CA else CA_CERT.subject)
         .public_key(pub)
         .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.now())
-        .not_valid_after(datetime.now() + timedelta(days=365))
+        # Use UTC (cryptography treats naive datetimes as UTC) and backdate a
+        # few minutes so clock skew between proxy and client can't make a
+        # freshly minted certificate appear "not yet valid".
+        .not_valid_before(datetime.now(timezone.utc) - timedelta(minutes=5))
+        .not_valid_after(datetime.now(timezone.utc) + timedelta(days=365))
         .add_extension(x509.BasicConstraints(ca=is_CA, path_length=None), critical=True)
         .add_extension(
             x509.KeyUsage(
@@ -145,8 +171,8 @@ def read_or_create_cert(host=None):
                 key_encipherment=True,
                 data_encipherment=False,
                 key_agreement=False,
-                key_cert_sign=is_CA,    # True for CA, False for host
-                crl_sign=is_CA,         # True for CA, False for host
+                key_cert_sign=is_CA,  # True for CA, False for host
+                crl_sign=is_CA,  # True for CA, False for host
                 encipher_only=False,
                 decipher_only=False,
             ),
@@ -161,15 +187,16 @@ def read_or_create_cert(host=None):
         )
     else:
         # Host-specific extensions
-        cert = cert.add_extension(
-            x509.SubjectAlternativeName([x509.DNSName(host)]), 
-            critical=False
-        ).add_extension(
-            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]),
-            critical=True,
-        ).add_extension(
-            x509.AuthorityKeyIdentifier.from_issuer_public_key(CA_KEY.public_key()),
-            critical=False,
+        cert = (
+            cert.add_extension(x509.SubjectAlternativeName([x509.DNSName(host)]), critical=False)
+            .add_extension(
+                x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]),
+                critical=True,
+            )
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(CA_KEY.public_key()),
+                critical=False,
+            )
         )
     logger.debug("Certificate constructed")
 
@@ -203,7 +230,9 @@ def read_or_create_cert(host=None):
 
 
 class MyHTTPServer(ThreadingHTTPServer):
-    """HTTPS proxy server with thread-per-connection handling"""
+    """Thread-per-connection server, used for both the forward (ProxyHandler)
+    and reverse (ReverseHandler) modes; the handler decides how to read the
+    target host. (A TCPServer happily serves a non-HTTP handler.)"""
 
     daemon_threads = True
 
@@ -219,9 +248,14 @@ class MyHTTPServer(ThreadingHTTPServer):
         self.return_code = 200  # Default if in intercept mode
         self.return_headers = []  # List of (name, value) tuples
         self.return_data = ""  # Response body
+        self.delay = 0
+        # Reverse mode only: host -> (ip, port) upstreams and the SNI context
+        self.upstream = {}
+        self.base_context = None
 
 
-class ProxyHandler(BaseHTTPRequestHandler):
+class ConnLoggingMixin:
+    """Per-connection timing and logging shared by the forward and reverse handlers."""
 
     def setup(self):
         self.start_time = time.perf_counter()
@@ -230,10 +264,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.server.counter += 1
             self.cid = "%04d" % self.server.counter
         super().setup()
-
-    def log_message(self, format, *args):
-        """Override to prevent access log messages from appearing on stderr"""
-        pass
 
     def _log(self, *args, **kwargs):
         """Log message with elapsed time since first message for this connection ID"""
@@ -280,114 +310,70 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self._log("\n  | ".join(lines))
         return len(blob), is_binary
 
-    def do_CONNECT(self):
-        self._multiline_log(
-            self.headers,
-            firstline=self.requestline,
-            direction="C->P",
-            include_binary=True,
-        )
-        host, port = self.path.split(":")
+    def _enforce_delay(self):
+        """Emulate a connection delay of self.server.delay seconds, if configured."""
+        if self.server.delay:
+            self._log("Enforcing %gs delay", self.server.delay)
+            current = self.last_time
+            finish = self.start_time + self.server.delay
+            while finish - current > 0.001:
+                time.sleep(finish - current)
+                current = time.perf_counter()
+            self._log("End of connection delay")
 
-        remote = None
-        client = None
-        error_code = 0
-        error_msg = None
+    def _serve_tunnel(self, client, host, upstream_addr):
+        """Service a decrypted client tunnel: either return a canned response
+        (interception) or forward to the real upstream while logging traffic.
 
-        try:
-            # Obtain MITM certificates for this host
-            with self.server.lock:
-                cert_file, key_file = read_or_create_cert(host)
-
-            if self.server.delay:
-                self._log("Enforcing %gs delay", self.server.delay)
-                current = self.last_time
-                finish = self.start_time + self.server.delay
-                while finish - current > 0.001:
-                    time.sleep(finish - current)
-                    current = time.perf_counter()
-                self._log("End of connection delay")
-
-            # Establish tunnel
-            self.send_response(200, "Connection Established")
-            self._multiline_log(
-                b"".join(self._headers_buffer) + b"\r\n",
-                direction="P->C",
-                include_binary=True,
-            )
-            self.end_headers()
-
-            # Create SSL context for the client connection (MITM certificate)
-            client_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-            client_context.load_cert_chain(cert_file, key_file)
-            client = client_context.wrap_socket(self.connection, server_side=True)
-            self._log("[C<>P] SSL handshake completed")
-
-            should_intercept = self.server.intercept_mode
-            if should_intercept and self.server.intercept_hosts:
-                should_intercept = host in self.server.intercept_hosts
-                if should_intercept:
-                    self._log("Host %s found in intercept list" % host)
-                else:
-                    self._log("Host %s not found in intercept list, forwarding" % host)
-
+        host drives intercept matching and the upstream SNI/verification name;
+        upstream_addr is the (address, port) actually dialed when forwarding,
+        which may differ from host (e.g. a pre-resolved IP in reverse mode)."""
+        should_intercept = self.server.intercept_mode
+        if should_intercept and self.server.intercept_hosts:
+            should_intercept = host in self.server.intercept_hosts
             if should_intercept:
-                # Read the decrypted request
-                request = t_request = client.recv(BUFFER_SIZE)
-                data = (self.server.return_data or "").encode("utf-8")
-                while len(t_request) == BUFFER_SIZE:
-                    t_request = client.recv(BUFFER_SIZE)
-                    request += t_request
-                self._multiline_log(request, direction="C->P", include_binary=True)
-
-                # Build and send custom response headers
-                response = ["HTTP/1.1 %d Intercepted" % self.server.return_code]
-                response.extend(": ".join(h) for h in self.server.return_headers)
-                if data:
-                    response.append("Content-Length: %d" % len(data))
-                response.extend(("", ""))
-                response = "\r\n".join(response).encode("iso-8859-1")
-                self._multiline_log(response, direction="P->C", include_binary=False)
-                client.sendall(response)
-
-                # Send response data if provided
-                if data:
-                    client.sendall(data)
-                    self._log("[P->C] %d data bytes delivered", len(data))
+                self._log("Host %s found in intercept list" % host)
             else:
-                # Create SSL context for the server connection (verify remote)
-                self._log("About to create connection to %s:%d", host, int(port))
-                remote = socket.create_connection((host, int(port)))
+                self._log("Host %s not found in intercept list, forwarding" % host)
+
+        if should_intercept:
+            # Read the decrypted request
+            request = t_request = client.recv(BUFFER_SIZE)
+            data = (self.server.return_data or "").encode("utf-8")
+            while len(t_request) == BUFFER_SIZE:
+                t_request = client.recv(BUFFER_SIZE)
+                request += t_request
+            self._multiline_log(request, direction="C->P", include_binary=True)
+
+            # Build and send custom response headers
+            response = ["HTTP/1.1 %d Intercepted" % self.server.return_code]
+            response.extend(": ".join(h) for h in self.server.return_headers)
+            if data:
+                response.append("Content-Length: %d" % len(data))
+            response.extend(("", ""))
+            response = "\r\n".join(response).encode("iso-8859-1")
+            self._multiline_log(response, direction="P->C", include_binary=False)
+            client.sendall(response)
+
+            # Send response data if provided
+            if data:
+                client.sendall(data)
+                self._log("[P->C] %d data bytes delivered", len(data))
+        else:
+            # Create SSL context for the server connection (verify remote)
+            remote = None
+            try:
+                self._log("About to create connection to %s:%d", *upstream_addr)
+                remote = socket.create_connection(upstream_addr)
                 self._log("About to wrap socket")
                 server_context = ssl.create_default_context()
                 remote = server_context.wrap_socket(remote, server_hostname=host)
                 self._log("[P<>S] SSL handshake completed")
                 # Forward all requests to the real server
                 self._forward_data(client, remote)
-
-        except ssl.SSLError as ssl_err:
-            self._log("SSL error: %s", ssl_err, level="error")
-            error_code, error_msg = 502, "SSL Handshake Failed"
-        except OSError as sock_err:
-            self._log("Socket error: %s", sock_err, level="error")
-            error_code, error_msg = 504, "Gateway Timeout"
-        except Exception as exc:
-            self._log("CONNECT error: %s", exc, level="error")
-            error_code, error_msg = 502, "Proxy Error"
-        finally:
-            if error_code:
-                try:
-                    self.send_error(error_code, error_msg)
-                except Exception:
-                    # If connection is already dead, sending an
-                    # error would raise socket.error
-                    pass
-            self.close_connection = True
-            if remote:
-                remote.close()
-            if client:
-                client.close()
-            self._log("Connection closed")
+            finally:
+                if remote:
+                    remote.close()
 
     def _forward_data(self, client, remote):
         """Forward data between client and remote, logging headers and tracking binary data size"""
@@ -439,11 +425,189 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._log("[S->C] %d data bytes received", r_total)
 
 
+class ProxyHandler(ConnLoggingMixin, BaseHTTPRequestHandler):
+    """Forward-proxy handler: clients reach us via CONNECT and the proxy
+    environment variables, so the target host arrives on the request line."""
+
+    def log_message(self, format, *args):
+        """Override to prevent access log messages from appearing on stderr"""
+        pass
+
+    def do_CONNECT(self):
+        self._multiline_log(
+            self.headers,
+            firstline=self.requestline,
+            direction="C->P",
+            include_binary=True,
+        )
+        host, port = self.path.split(":")
+
+        client = None
+        error_code = 0
+        error_msg = None
+
+        try:
+            # Obtain MITM certificates for this host
+            with self.server.lock:
+                cert_file, key_file = read_or_create_cert(host)
+
+            self._enforce_delay()
+
+            # Establish tunnel
+            self.send_response(200, "Connection Established")
+            self._multiline_log(
+                b"".join(self._headers_buffer) + b"\r\n",
+                direction="P->C",
+                include_binary=True,
+            )
+            self.end_headers()
+
+            # Create SSL context for the client connection (MITM certificate)
+            client_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            client_context.load_cert_chain(cert_file, key_file)
+            client = client_context.wrap_socket(self.connection, server_side=True)
+            self._log("[C<>P] SSL handshake completed")
+
+            # Forward mode resolves the host normally (/etc/hosts untouched here)
+            self._serve_tunnel(client, host, (host, int(port)))
+
+        except ssl.SSLError as ssl_err:
+            self._log("SSL error: %s", ssl_err, level="error")
+            error_code, error_msg = 502, "SSL Handshake Failed"
+        except OSError as sock_err:
+            self._log("Socket error: %s", sock_err, level="error")
+            error_code, error_msg = 504, "Gateway Timeout"
+        except Exception as exc:
+            self._log("CONNECT error: %s", exc, level="error")
+            error_code, error_msg = 502, "Proxy Error"
+        finally:
+            if error_code:
+                try:
+                    self.send_error(error_code, error_msg)
+                except Exception:
+                    # If connection is already dead, sending an
+                    # error would raise socket.error
+                    pass
+            self.close_connection = True
+            if client:
+                client.close()
+            self._log("Connection closed")
+
+
+class ReverseHandler(ConnLoggingMixin, socketserver.BaseRequestHandler):
+    """Transparent/reverse handler: clients connect straight to us (via an
+    /etc/hosts redirect) and open TLS immediately, so the target host comes
+    from the TLS SNI field rather than a CONNECT line."""
+
+    def handle(self):
+        client = None
+        try:
+            self._enforce_delay()
+
+            # The SNI callback stamps the requested hostname on the socket as it
+            # selects the per-host certificate during the handshake.
+            client = self.server.base_context.wrap_socket(self.request, server_side=True)
+            host = getattr(client, "proxyspy_host", None)
+            self._log("[C<>P] SSL handshake completed (SNI: %s)", host)
+            if not host:
+                self._log("No SNI hostname provided by client; closing", level="error")
+                return
+
+            upstream = self.server.upstream.get(host)
+            if upstream is None:
+                # Not a declared host: fall back to resolving the SNI name. This
+                # only succeeds if it is not redirected to us in /etc/hosts.
+                upstream = (host, 443)
+            self._serve_tunnel(client, host, upstream)
+
+        except ssl.SSLError as ssl_err:
+            self._log("SSL error: %s", ssl_err, level="error")
+        except OSError as sock_err:
+            self._log("Socket error: %s", sock_err, level="error")
+        except Exception as exc:
+            self._log("Reverse connection error: %s", exc, level="error")
+        finally:
+            if client:
+                client.close()
+            self._log("Connection closed")
+
+
 def find_free_port():
     """Find a free port that's not in TIME_WAIT state."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))  # Let OS choose port
         return s.getsockname()[1]
+
+
+def make_sni_context():
+    """Build the server-side SSL context used by reverse mode. Its SNI callback
+    records the requested hostname on the connection and swaps in that host's
+    MITM certificate, minting one on first sight."""
+    base = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    host_contexts = {}
+
+    def sni_callback(sock, server_name, ctx):
+        sock.proxyspy_host = server_name
+        if not server_name:
+            return
+        host_ctx = host_contexts.get(server_name)
+        if host_ctx is None:
+            cert_file, key_file = read_or_create_cert(server_name)
+            host_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            host_ctx.load_cert_chain(cert_file, key_file)
+            host_contexts[server_name] = host_ctx
+        sock.context = host_ctx
+
+    base.sni_callback = sni_callback
+    return base
+
+
+def resolve_upstream(host, port, overrides):
+    """Resolve host to a real (ip, port) upstream, preferring --map overrides.
+    Refuses a loopback result unless pinned, since that means the host is
+    already redirected to us in /etc/hosts and forwarding would loop back."""
+    if host in overrides:
+        return overrides[host], port
+    ip = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)[0][4][0]
+    if ipaddress.ip_address(ip).is_loopback:
+        raise RuntimeError(
+            "%s already resolves to a loopback address (%s); remove it from "
+            "/etc/hosts before starting, or pin it with --map %s=<ip>" % (host, ip, host)
+        )
+    return ip, port
+
+
+def default_cert_dir():
+    """~/.proxyspy, resolving the invoking user's home even under sudo."""
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        import pwd
+
+        home = pwd.getpwnam(sudo_user).pw_dir
+    else:
+        home = os.path.expanduser("~")
+    return join(home, ".proxyspy")
+
+
+def configure_intercept(server, args):
+    """Apply --return-* / --intercept-host options to a server. Returns False
+    on a malformed --return-header."""
+    server.delay = max(0, args.delay)
+    if any(x is not None for x in [args.return_code, args.return_data]) or args.return_header:
+        server.intercept_mode = True
+        server.return_code = args.return_code or 200
+        server.return_data = args.return_data or ""
+        server.intercept_hosts = args.intercept_host or []
+
+        server.return_headers = []
+        for header in args.return_header or []:
+            try:
+                name, value = header.split(":", 1)
+                server.return_headers.append((name.strip(), value.strip()))
+            except ValueError:
+                logger.error("Invalid header format: %s", header)
+                return False
+    return True
 
 
 #
@@ -463,8 +627,8 @@ def main():
         "--port",
         "-p",
         type=int,
-        default=0,
-        help="Port for the proxy server (default: auto-select)",
+        default=None,
+        help="Port for the proxy server (default: auto-select, or 443 in --reverse mode)",
     )
     parser.add_argument(
         "--delay",
@@ -477,6 +641,32 @@ def main():
         "--keep-certs",
         action="store_true",
         help="Keep certificates in current directory instead of using a temporary directory",
+    )
+    parser.add_argument(
+        "--reverse",
+        action="store_true",
+        help="Run as a standalone reverse/transparent proxy: listen on 127.0.0.1 "
+        "(default port 443) and read the target host from TLS SNI, instead of "
+        "running a command behind proxy environment variables. Redirect the "
+        "target hostnames to 127.0.0.1 in /etc/hosts.",
+    )
+    parser.add_argument(
+        "--cert-dir",
+        help="Directory for the persistent CA and host certificates "
+        "(reverse mode default: ~/.proxyspy)",
+    )
+    parser.add_argument(
+        "--map",
+        action="append",
+        metavar="HOST=IP",
+        help="Pin the real upstream IP for HOST, bypassing DNS (reverse mode; can be repeated). "
+        "Use this when HOST is already redirected to 127.0.0.1 in /etc/hosts.",
+    )
+    parser.add_argument(
+        "--upstream-port",
+        type=int,
+        default=443,
+        help="Port to connect to on the real upstream servers (reverse mode; default: 443)",
     )
     parser.add_argument(
         "--return-code",
@@ -502,8 +692,24 @@ def main():
     )
     parser.add_argument("--return-data", help="Response body to return")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    parser.add_argument("command", nargs="+", help="Command to run and its arguments")
+    parser.add_argument(
+        "command", nargs="*", help="Command to run and its arguments (forward mode only)"
+    )
     args = parser.parse_args()
+
+    # Validate mode/command combination
+    if args.reverse and args.command:
+        parser.error("a command cannot be given in --reverse mode")
+    if not args.reverse and not args.command:
+        parser.error("a command is required (or use --reverse for standalone mode)")
+
+    # Parse --map HOST=IP overrides
+    overrides = {}
+    for entry in args.map or []:
+        host, sep, ip = entry.partition("=")
+        if not sep or not host or not ip:
+            parser.error("--map expects HOST=IP, got: %s" % entry)
+        overrides[host] = ip
 
     # Configure logging
     logging_config = {
@@ -520,8 +726,12 @@ def main():
     # Log version info immediately after logging setup
     logger.info("ProxySpy version %s", __version__)
 
-    # Set up certificate generation
-    if args.keep_certs:
+    # Set up certificate generation. Reverse mode persists certificates so the
+    # CA can be trusted once and reused; forward mode keeps the old behavior.
+    if args.cert_dir or args.reverse:
+        CERT_DIR = args.cert_dir or default_cert_dir()
+        os.makedirs(CERT_DIR, exist_ok=True)
+    elif args.keep_certs:
         CERT_DIR = os.getcwd()
     else:
         CERT_DIR = tempfile.mkdtemp()
@@ -533,34 +743,53 @@ def main():
         atexit.register(cleanup)
     logger.info("Certificate directory: %s", CERT_DIR)
     cert_path, key_path = read_or_create_cert()
-    for host in set(args.intercept_host or ()) | set(args.prepare_host or ()):
+    declared_hosts = set(args.intercept_host or ()) | set(args.prepare_host or ())
+    for host in declared_hosts:
         read_or_create_cert(host)
 
-    # Start and configure server
-    port = args.port
+    # Select the listen port (reverse mode defaults to 443; 0 = auto-select)
+    if args.port is None:
+        port = 443 if args.reverse else 0
+    else:
+        port = args.port
     if port == 0:
         port = find_free_port()
         logger.info("Auto-selected port %d", port)
-    server = MyHTTPServer(("127.0.0.1", port), ProxyHandler)
-    server.delay = max(0, args.delay)
 
-    # Enable interception if any response-related args are provided
-    if any(x is not None for x in [args.return_code, args.return_data]) or args.return_header:
-        server.intercept_mode = True
-        server.return_code = args.return_code or 200
-        server.return_data = args.return_data or ""
-        server.intercept_hosts = args.intercept_host or []
+    server = MyHTTPServer(("127.0.0.1", port), ReverseHandler if args.reverse else ProxyHandler)
+    if not configure_intercept(server, args):
+        return 1
 
-        # Parse headers
-        server.return_headers = []
-        if args.return_header:
-            for header in args.return_header:
-                try:
-                    name, value = header.split(":", 1)
-                    server.return_headers.append((name.strip(), value.strip()))
-                except ValueError:
-                    logger.error("Invalid header format: %s", header)
-                    return 1
+    # Reverse/transparent mode: serve in the foreground until interrupted.
+    if args.reverse:
+        server.base_context = make_sni_context()
+        # A host that is always intercepted never connects upstream, so skip
+        # resolving it (avoids a needless lookup and the loopback guard firing).
+        intercept_all = server.intercept_mode and not server.intercept_hosts
+        for host in declared_hosts:
+            if intercept_all or host in server.intercept_hosts:
+                continue
+            try:
+                server.upstream[host] = resolve_upstream(host, args.upstream_port, overrides)
+            except (RuntimeError, OSError) as exc:
+                logger.error("Cannot resolve upstream for %s: %s", host, exc)
+                return 1
+            logger.info("Upstream for %s -> %s:%d", host, *server.upstream[host])
+        logger.info("Reverse proxy listening on 127.0.0.1:%d", port)
+        logger.info("Trust the CA certificate at: %s", cert_path)
+        logger.info(
+            "Redirect these hosts to 127.0.0.1 in /etc/hosts: %s",
+            ", ".join(sorted(declared_hosts)) or "(none declared)",
+        )
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            logger.info("Interrupted; shutting down")
+        finally:
+            server.shutdown()
+            server.server_close()
+        return 0
+
     server_thread = Thread(target=server.serve_forever)
     server_thread.daemon = True
     server_thread.start()
