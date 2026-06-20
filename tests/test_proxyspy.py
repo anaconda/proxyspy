@@ -501,7 +501,12 @@ def test_intercept_headers(proxy, session):
 
 
 def test_intercept_hosts(proxy, session):
-    """Test that the proxy only intercepts requests matching the specified patterns."""
+    """Test that the proxy only intercepts requests matching the specified patterns.
+
+    The intercepted hosts (example.com/.org) are never contacted upstream, so
+    they need not be real; only the single non-intercepted control is forwarded
+    to a live server, keeping httpbingo.org as the sole network dependency.
+    """
     proxy.start_proxy(
         "--return-code",
         "418",
@@ -510,39 +515,27 @@ def test_intercept_hosts(proxy, session):
         "--return-data",
         '{"status": "intercepted by host list"}',
         "--intercept-host",
-        "httpbingo.org",
-        "--intercept-host",
         "example.com",
+        "--intercept-host",
+        "example.org",
     )
 
-    # Request 1: Should match first pattern
-    resp_match1 = session.get("https://httpbingo.org/get")
-    assert resp_match1.status_code == 418
-    proxy.verify_header(resp_match1, "X-Test", "Host Match")
-    assert resp_match1.json() == {"status": "intercepted by host list"}
+    # Requests 1 & 2: hosts in the intercept list -> canned response, no upstream
+    for host in ("example.com", "example.org"):
+        resp_match = session.get(f"https://{host}/")
+        assert resp_match.status_code == 418
+        proxy.verify_header(resp_match, "X-Test", "Host Match")
+        assert resp_match.json() == {"status": "intercepted by host list"}
+        proxy.get_logs(force=True)
+        assert any(f"{host} found in intercept list" in line for line in proxy.get_logs())
 
-    # Force refresh logs and verify first request
-    proxy.get_logs(force=True)
-    assert any("httpbingo.org found in intercept list" in line for line in proxy.get_logs())
-
-    # Request 2: Should match second pattern
-    resp_match2 = session.get("https://example.com/")
-    assert resp_match2.status_code == 418
-    proxy.verify_header(resp_match2, "X-Test", "Host Match")
-    assert resp_match2.json() == {"status": "intercepted by host list"}
-
-    # Force refresh logs and verify second request
-    proxy.get_logs(force=True)
-    assert any("example.com found in intercept list" in line for line in proxy.get_logs())
-
-    # Request 3: Should not match any pattern
-    resp_nomatch = session.get("https://example.org/")
+    # Request 3: host not in the intercept list -> forwarded to the real server
+    resp_nomatch = session.get("https://httpbingo.org/get")
     assert resp_nomatch.status_code == 200
-    assert "Example Domain" in resp_nomatch.text
 
-    # Force refresh logs and verify third request
+    # Force refresh logs and verify the forwarded request
     logs = proxy.get_logs(force=True)
-    assert any("example.org not found in intercept list" in line for line in logs)
+    assert any("httpbingo.org not found in intercept list" in line for line in logs)
 
     # Check connections to verify SSL handshakes
     connections = proxy.get_connections()
@@ -555,15 +548,15 @@ def test_intercept_hosts(proxy, session):
         return None
 
     # Verify both matching connections were intercepted (client SSL but no server SSL)
-    for domain in ["httpbingo.org", "example.com"]:
+    for domain in ["example.com", "example.org"]:
         conn_lines = find_connection(domain)
         assert conn_lines is not None, f"Connection for {domain} not found"
         assert any("[C<>P] SSL handshake completed" in line for line in conn_lines)
         assert not any("[P<>S] SSL handshake completed" in line for line in conn_lines)
 
     # Verify non-matching connection was forwarded (both client and server SSL)
-    nonmatch_lines = find_connection("example.org")
-    assert nonmatch_lines is not None, "Connection for example.org not found"
+    nonmatch_lines = find_connection("httpbingo.org")
+    assert nonmatch_lines is not None, "Connection for httpbingo.org not found"
     assert any("[C<>P] SSL handshake completed" in line for line in nonmatch_lines)
     assert any("[P<>S] SSL handshake completed" in line for line in nonmatch_lines)
 
