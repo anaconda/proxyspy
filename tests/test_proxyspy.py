@@ -18,6 +18,19 @@ from urllib3.util.retry import MaxRetryError, Retry
 EXCEPTIONS = ConnectionError, ProxyError, ReadTimeout, RequestException, MaxRetryError
 
 
+def _robust_rmtree(path, attempts=5):
+    """shutil.rmtree that tolerates Windows' lag in releasing file/dir handles
+    held by a just-terminated subprocess (WinError 32)."""
+    for attempt in range(attempts):
+        try:
+            shutil.rmtree(path)
+            return
+        except (PermissionError, OSError):
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.5 * (attempt + 1))
+
+
 def find_proxyspy():
     """Locate the proxyspy script in development or installed environments."""
     # First look for proxyspy.py in development location
@@ -251,8 +264,20 @@ def proxy(tmp_path):
 
 def _get_session():
     session = requests.Session()
+    # CI runners (especially Windows) have flaky outbound networking and the
+    # public test endpoints rate-limit, surfacing as connection resets
+    # (WinError 10054 -> ProxyError) rather than HTTP error codes. Retry both
+    # connection-level and status-level failures, with enough total backoff
+    # (~1+2+4+8+16+32 = up to ~60s) to ride out a transient network blip.
     retry_strategy = Retry(
-        total=5, backoff_factor=0.5, backoff_jitter=0.5, status_forcelist=[500, 502, 503, 504]
+        total=6,
+        connect=6,
+        read=6,
+        status=6,
+        backoff_factor=1.0,
+        backoff_jitter=1.0,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=None,  # retry all methods, including the test GETs
     )
     adapter = HTTPAdapter(max_retries=retry_strategy)
     session.mount("https://", adapter)
@@ -577,9 +602,13 @@ def test_keep_certs(proxy, session):
         assert host_key.exists(), "Host key removed"
 
     finally:
-        # Clean up and restore directory
+        # Clean up and restore directory. On Windows the proxy subprocess runs
+        # with its cwd inside temp_dir and locks it, so make sure it is stopped
+        # (releasing the directory handle) before removing the tree, and retry
+        # rmtree to absorb the lag in Windows releasing the handle.
         os.chdir(orig_dir)
-        shutil.rmtree(temp_dir)
+        proxy.stop_proxy()
+        _robust_rmtree(temp_dir)
 
 
 def test_proxy_delay(proxy, session):
@@ -830,18 +859,27 @@ def test_reverse_forward(reverse):
     logs = reverse.logs()
     assert "Upstream for httpbingo.org ->" in logs, "Upstream was not resolved at startup"
 
-    sock = reverse.connect("httpbingo.org")
-    sock.sendall(b"GET /get HTTP/1.1\r\nHost: httpbingo.org\r\nConnection: close\r\n\r\n")
+    # The raw socket has no retry layer, and the live upstream may reset the
+    # connection on a flaky CI runner, so retry the whole request a few times
+    # with backoff before giving up.
     response = b""
-    while True:
+    for attempt in range(5):
+        response = b""
         try:
-            chunk = sock.recv(4096)
-        except (OSError, ssl.SSLError):
+            sock = reverse.connect("httpbingo.org")
+            sock.sendall(b"GET /get HTTP/1.1\r\nHost: httpbingo.org\r\nConnection: close\r\n\r\n")
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+            sock.close()
+        except (OSError, ssl.SSLError) as exc:
+            print(f"reverse forward attempt {attempt} failed: {exc}")
+            response = b""
+        if response.split(b"\r\n", 1)[0].startswith(b"HTTP/1.1 "):
             break
-        if not chunk:
-            break
-        response += chunk
-    sock.close()
+        time.sleep(2 * (attempt + 1))
 
     # A real upstream response came back (status code varies with rate limits,
     # so just assert a well-formed HTTP status line rather than pinning 200).
