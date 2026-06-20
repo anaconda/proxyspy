@@ -1,3 +1,5 @@
+import ipaddress
+import json
 import os
 import shutil
 import socket
@@ -5,17 +7,28 @@ import ssl
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from subprocess import Popen
+from threading import Thread
 
 import psutil
 import pytest
 import requests
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 from requests.adapters import HTTPAdapter
 from requests.exceptions import ConnectionError, ProxyError, ReadTimeout, RequestException
 from urllib3.util.retry import MaxRetryError, Retry
 
 EXCEPTIONS = ConnectionError, ProxyError, ReadTimeout, RequestException, MaxRetryError
+
+# Hostname the forwarding tests use for the in-process origin. It resolves to
+# loopback without DNS and the origin's certificate is valid for it.
+ORIGIN_HOST = "localhost"
 
 
 def _robust_rmtree(path, attempts=5):
@@ -29,6 +42,109 @@ def _robust_rmtree(path, attempts=5):
             if attempt == attempts - 1:
                 raise
             time.sleep(0.5 * (attempt + 1))
+
+
+def _make_origin_cert(cert_dir):
+    """Generate a self-signed cert/key valid for ORIGIN_HOST and 127.0.0.1.
+
+    The cert serves double duty: it is the origin's server certificate and,
+    because it is self-signed, its own CA file. Pointing the proxy's
+    SSL_CERT_FILE at it lets proxyspy verify the origin upstream.
+    """
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, ORIGIN_HOST)])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.now(timezone.utc) - timedelta(minutes=5))
+        .not_valid_after(datetime.now(timezone.utc) + timedelta(days=365))
+        .add_extension(
+            x509.SubjectAlternativeName(
+                [x509.DNSName(ORIGIN_HOST), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]
+            ),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+    cert_path = os.path.join(cert_dir, "origin-cert.pem")
+    key_path = os.path.join(cert_dir, "origin-key.pem")
+    with open(cert_path, "wb") as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+    with open(key_path, "wb") as f:
+        f.write(
+            key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption(),
+            )
+        )
+    return cert_path, key_path
+
+
+class _OriginHandler(BaseHTTPRequestHandler):
+    """Minimal stand-in for the httpbin endpoints the tests exercise:
+    /get (JSON echo), /bytes/<n> (n bytes), and ?ndx=N query echo on /get."""
+
+    def log_message(self, *args):
+        pass  # keep test output quiet
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path == "/get":
+            body = json.dumps({"url": self.path, "headers": dict(self.headers)}).encode()
+            self._respond(200, body, "application/json")
+        elif path.startswith("/bytes/"):
+            try:
+                n = int(path.rsplit("/", 1)[1])
+            except ValueError:
+                self._respond(404, b"bad byte count", "text/plain")
+                return
+            self._respond(200, bytes(n), "application/octet-stream")
+        else:
+            self._respond(404, b"not found", "text/plain")
+
+    def _respond(self, code, body, content_type):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class LocalOrigin:
+    """In-process HTTPS origin so the forwarding tests don't depend on a public
+    server. Cross-platform and available to local `pytest` runs."""
+
+    def __init__(self, cert_dir):
+        self.cert_path, self.key_path = _make_origin_cert(cert_dir)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(self.cert_path, self.key_path)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _OriginHandler)
+        self.server.socket = ctx.wrap_socket(self.server.socket, server_side=True)
+        self.port = self.server.server_address[1]
+        self.thread = Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def base_url(self):
+        return f"https://{ORIGIN_HOST}:{self.port}"
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def origin(tmp_path):
+    """A running in-process HTTPS origin; yields the LocalOrigin instance."""
+    server = LocalOrigin(str(tmp_path))
+    try:
+        yield server
+    finally:
+        server.stop()
 
 
 def find_proxyspy():
@@ -64,8 +180,13 @@ class ProxyTestHarness:
         self.old_env = dict(os.environ)
         self.logs = None
 
-    def start_proxy(self, *extra_args):
-        """Start the proxy with a long-running sleep process."""
+    def start_proxy(self, *extra_args, trust=None):
+        """Start the proxy with a long-running sleep process.
+
+        trust: optional path to a CA/cert file the proxy process should trust
+        for upstream verification (via SSL_CERT_FILE), e.g. a LocalOrigin's
+        certificate so the proxy can forward to the in-process origin.
+        """
         # Find an available port by trying until we succeed
 
         # Default to port 0 (auto-selection) if no port specified
@@ -92,7 +213,12 @@ class ProxyTestHarness:
         # Long-running process to keep proxy alive
         cmd.extend(("--debug", "--", "sleep", "3600"))
         print(f"\nStarting proxy server: {' '.join(cmd)}")
-        self.proxy_process = Popen(cmd)
+        env = os.environ.copy()
+        if trust:
+            # The proxy verifies upstream certs with create_default_context();
+            # SSL_CERT_FILE makes it trust the in-process origin's certificate.
+            env["SSL_CERT_FILE"] = str(trust)
+        self.proxy_process = Popen(cmd, env=env)
         self.proxy_psutil = psutil.Process(self.proxy_process.pid)
 
         # Wait for and parse startup logs
@@ -371,20 +497,20 @@ def test_proxy_intercept(proxy, session):
     proxy.assert_intercepted()
 
 
-def test_forwarding_response_body(proxy, session):
+def test_forwarding_response_body(proxy, session, origin):
     """Test that forwarded responses handle response bodies correctly."""
-    proxy.start_proxy()
+    proxy.start_proxy(trust=origin.cert_path)
 
     # Try bytes endpoint first with small payload
     print("\nTesting small binary response")
-    response = session.get("https://httpbingo.org/bytes/64")
+    response = session.get(f"{origin.base_url}/bytes/64")
     assert response.status_code == 200
     assert len(response.content) == 64
     print("Successfully received 64 bytes")
 
     # Now try the larger response
     print("\nTesting 1KB binary response")
-    response = session.get("https://httpbingo.org/bytes/1024")
+    response = session.get(f"{origin.base_url}/bytes/1024")
     assert response.status_code == 200
     print(f"Received {len(response.content)} bytes")
     assert len(response.content) == 1024
@@ -500,12 +626,12 @@ def test_intercept_headers(proxy, session):
     proxy.assert_intercepted()
 
 
-def test_intercept_hosts(proxy, session):
+def test_intercept_hosts(proxy, session, origin):
     """Test that the proxy only intercepts requests matching the specified patterns.
 
     The intercepted hosts (example.com/.org) are never contacted upstream, so
     they need not be real; only the single non-intercepted control is forwarded
-    to a live server, keeping httpbingo.org as the sole network dependency.
+    to the in-process origin, so the test has no public-network dependency.
     """
     proxy.start_proxy(
         "--return-code",
@@ -518,6 +644,7 @@ def test_intercept_hosts(proxy, session):
         "example.com",
         "--intercept-host",
         "example.org",
+        trust=origin.cert_path,
     )
 
     # Requests 1 & 2: hosts in the intercept list -> canned response, no upstream
@@ -529,13 +656,13 @@ def test_intercept_hosts(proxy, session):
         proxy.get_logs(force=True)
         assert any(f"{host} found in intercept list" in line for line in proxy.get_logs())
 
-    # Request 3: host not in the intercept list -> forwarded to the real server
-    resp_nomatch = session.get("https://httpbingo.org/get")
+    # Request 3: host not in the intercept list -> forwarded to the origin
+    resp_nomatch = session.get(f"{origin.base_url}/get")
     assert resp_nomatch.status_code == 200
 
     # Force refresh logs and verify the forwarded request
     logs = proxy.get_logs(force=True)
-    assert any("httpbingo.org not found in intercept list" in line for line in logs)
+    assert any(f"{ORIGIN_HOST} not found in intercept list" in line for line in logs)
 
     # Check connections to verify SSL handshakes
     connections = proxy.get_connections()
@@ -555,13 +682,13 @@ def test_intercept_hosts(proxy, session):
         assert not any("[P<>S] SSL handshake completed" in line for line in conn_lines)
 
     # Verify non-matching connection was forwarded (both client and server SSL)
-    nonmatch_lines = find_connection("httpbingo.org")
-    assert nonmatch_lines is not None, "Connection for httpbingo.org not found"
+    nonmatch_lines = find_connection(ORIGIN_HOST)
+    assert nonmatch_lines is not None, f"Connection for {ORIGIN_HOST} not found"
     assert any("[C<>P] SSL handshake completed" in line for line in nonmatch_lines)
     assert any("[P<>S] SSL handshake completed" in line for line in nonmatch_lines)
 
 
-def test_keep_certs(proxy, session):
+def test_keep_certs(proxy, session, origin):
     """Test that --keep-certs option keeps certificates in current directory."""
     # Start in a clean temp directory
     orig_dir = os.getcwd()
@@ -571,7 +698,7 @@ def test_keep_certs(proxy, session):
 
     try:
         # Start proxy with --keep-certs
-        proxy.start_proxy("--keep-certs")
+        proxy.start_proxy("--keep-certs", trust=origin.cert_path)
 
         # Verify CA cert files exist in current directory
         ca_cert = Path("cert.pem")
@@ -579,11 +706,11 @@ def test_keep_certs(proxy, session):
         assert ca_cert.exists(), "CA certificate not found"
         assert ca_key.exists(), "CA key not found"
 
-        session.get("https://httpbingo.org/get")
+        session.get(f"{origin.base_url}/get")
 
         # Verify host cert files exist
-        host_cert = Path("httpbingo.org-cert.pem")
-        host_key = Path("httpbingo.org-key.pem")
+        host_cert = Path(f"{ORIGIN_HOST}-cert.pem")
+        host_key = Path(f"{ORIGIN_HOST}-key.pem")
         assert host_cert.exists(), "Host certificate not found"
         assert host_key.exists(), "Host key not found"
 
@@ -640,13 +767,13 @@ def test_proxy_delay(proxy, session):
             pytest.fail("No 'End of delay' message found in logs")
 
 
-def test_concurrent_connections(proxy):
+def test_concurrent_connections(proxy, origin):
     """Test that the proxy can handle multiple simultaneous connections."""
-    proxy.start_proxy()
+    proxy.start_proxy(trust=origin.cert_path)
 
     def make_request(i):
         # Create session with retry strategy
-        url = f"https://httpbingo.org/get?ndx={i}"
+        url = f"{origin.base_url}/get?ndx={i}"
         try:
             resp = _get_session().get(url, timeout=5.0)
             return resp.status_code, i
@@ -736,7 +863,7 @@ class ReverseHarness:
         self.process = None
         self.port = None
 
-    def start(self, *extra_args, expect_exit=False):
+    def start(self, *extra_args, expect_exit=False, trust=None):
         if isinstance(self.script_path, Path) or str(self.script_path).endswith(".py"):
             cmd = ["python", str(self.script_path)]
         else:
@@ -753,7 +880,11 @@ class ReverseHarness:
         ]
         cmd += list(extra_args)
         print(f"\nStarting reverse proxy: {' '.join(cmd)}")
-        self.process = Popen(cmd)
+        env = os.environ.copy()
+        if trust:
+            # Trust the in-process origin's cert for upstream verification.
+            env["SSL_CERT_FILE"] = str(trust)
+        self.process = Popen(cmd, env=env)
 
         # When we expect a clean startup, wait for the listening line and port.
         if expect_exit:
@@ -844,41 +975,37 @@ def test_reverse_intercept(reverse):
     assert "[P<>S] SSL handshake completed" not in logs
 
 
-def test_reverse_forward(reverse):
-    """Reverse mode resolves the real upstream at startup and forwards a live
-    request, MITMing both ends."""
-    reverse.start("--prepare-host", "httpbingo.org")
+def test_reverse_forward(reverse, origin):
+    """Reverse mode forwards to the upstream, MITMing both ends. The upstream
+    is pinned to the in-process origin with --map, which also exercises the
+    upstream-override path and avoids any public-network dependency."""
+    reverse.start(
+        "--prepare-host",
+        ORIGIN_HOST,
+        "--map",
+        f"{ORIGIN_HOST}=127.0.0.1",
+        "--upstream-port",
+        str(origin.port),
+        trust=origin.cert_path,
+    )
 
     logs = reverse.logs()
-    assert "Upstream for httpbingo.org ->" in logs, "Upstream was not resolved at startup"
+    assert f"Upstream for {ORIGIN_HOST} ->" in logs, "Upstream was not configured at startup"
 
-    # The raw socket has no retry layer, and the live upstream may reset the
-    # connection on a flaky CI runner, so retry the whole request a few times
-    # with backoff before giving up.
+    sock = reverse.connect(ORIGIN_HOST)
+    sock.sendall(f"GET /get HTTP/1.1\r\nHost: {ORIGIN_HOST}\r\nConnection: close\r\n\r\n".encode())
     response = b""
-    for attempt in range(5):
-        response = b""
-        try:
-            sock = reverse.connect("httpbingo.org")
-            sock.sendall(b"GET /get HTTP/1.1\r\nHost: httpbingo.org\r\nConnection: close\r\n\r\n")
-            while True:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                response += chunk
-            sock.close()
-        except (OSError, ssl.SSLError) as exc:
-            print(f"reverse forward attempt {attempt} failed: {exc}")
-            response = b""
-        if response.split(b"\r\n", 1)[0].startswith(b"HTTP/1.1 "):
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
             break
-        time.sleep(2 * (attempt + 1))
+        response += chunk
+    sock.close()
 
-    # A real upstream response came back (status code varies with rate limits,
-    # so just assert a well-formed HTTP status line rather than pinning 200).
-    assert response.split(b"\r\n", 1)[0].startswith(b"HTTP/1.1 ")
+    status_line = response.split(b"\r\n", 1)[0]
+    assert status_line.startswith(b"HTTP/") and b" 200" in status_line, status_line
     logs = reverse.logs()
-    assert "SSL handshake completed (SNI: httpbingo.org)" in logs
+    assert f"SSL handshake completed (SNI: {ORIGIN_HOST})" in logs
     assert "[P<>S] SSL handshake completed" in logs
 
 
