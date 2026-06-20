@@ -390,20 +390,8 @@ def proxy(tmp_path):
 
 def _get_session():
     session = requests.Session()
-    # CI runners (especially Windows) have flaky outbound networking and the
-    # public test endpoints rate-limit, surfacing as connection resets
-    # (WinError 10054 -> ProxyError) rather than HTTP error codes. Retry both
-    # connection-level and status-level failures, with enough total backoff
-    # (~1+2+4+8+16+32 = up to ~60s) to ride out a transient network blip.
     retry_strategy = Retry(
-        total=6,
-        connect=6,
-        read=6,
-        status=6,
-        backoff_factor=1.0,
-        backoff_jitter=1.0,
-        status_forcelist=[500, 502, 503, 504],
-        allowed_methods=None,  # retry all methods, including the test GETs
+        total=5, backoff_factor=0.5, backoff_jitter=0.5, status_forcelist=[500, 502, 503, 504]
     )
     adapter = HTTPAdapter(max_retries=retry_strategy)
     session.mount("https://", adapter)
