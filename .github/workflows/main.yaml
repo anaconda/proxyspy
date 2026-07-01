@@ -99,6 +99,13 @@ jobs:
         conda activate testconda
         pytest -v tests
 
+    - name: Test /etc/hosts management (root-gated, POSIX only)
+      if: runner.os != 'Windows'
+      run: |
+        conda activate testconda
+        sudo -E env "PATH=$PATH" PROXYSPY_TEST_HOSTS=1 \
+          python -m pytest -v tests -k ManageHostsIntegration
+
     - name: Test package (pip)
       run: |
         wheel_file=$(ls dist/proxyspy-*.whl)

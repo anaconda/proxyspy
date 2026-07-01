@@ -83,6 +83,8 @@ The tool starts a proxy server and then runs the specified command with appropri
 - `--intercept-host HOST`: Only intercept requests to HOST (can repeat)
 - `--prepare-host HOST`: Pre-generate the certificate for HOST to avoid first-connection delay (can repeat)
 - `--reverse`: Run as a standalone reverse/transparent proxy instead of running a command (see below)
+- `--manage-hosts`: Automatically add/remove the `/etc/hosts` redirects for declared hosts for the run's lifetime (reverse mode only; POSIX only; see below)
+- `--restore-hosts`: Remove any proxyspy-managed block from `/etc/hosts` and exit (standalone; POSIX only)
 - `--cert-dir DIR`: Directory for the persistent CA and host certificates (reverse mode default: `~/.proxyspy`)
 - `--map HOST=IP`: Pin the real upstream IP for HOST, bypassing DNS (reverse mode; can repeat)
 - `--upstream-port PORT`: Port to dial on the real upstream servers in reverse mode (default: 443)
@@ -176,6 +178,22 @@ Notes:
 * `--cert-dir` overrides where the persistent CA and host certificates live. Under `sudo`, the default `~/.proxyspy` resolves to the invoking user's home (via `SUDO_USER`), not root's.
 * `--map HOST=IP` pins an upstream IP, bypassing startup resolution. Use it when a host is already in `/etc/hosts`, or to target a specific backend.
 * A host listed only in `--intercept-host` (with no forwarding) never connects upstream, so it is not resolved.
+
+### Automatic `/etc/hosts` management (opt-in)
+
+Add `--manage-hosts` to have proxyspy add and remove the `/etc/hosts` redirects itself, so a session is self-contained: start it, use it, Ctrl-C, and the file is back to how it was. This replaces steps 3 and 5 of the manual workflow above; everything else (running as root, trusting the CA) is unchanged:
+
+```bash
+sudo proxyspy --reverse --manage-hosts --prepare-host repo.anaconda.com -l spy.log
+```
+
+proxyspy writes a fenced block to `/etc/hosts` containing only the redirects for the declared hosts, keeping a one-time backup at `/etc/hosts.proxyspy.bak`, and removes the block on a clean exit (Ctrl-C or SIGTERM). If a previous run is killed uncatchably (`SIGKILL`, power loss) and leaves the block behind, the next `--manage-hosts` start self-heals by removing it before resolving upstreams. To force-clean a stale block without starting proxyspy, run:
+
+```bash
+sudo proxyspy --restore-hosts
+```
+
+`--manage-hosts` and `--restore-hosts` are POSIX-only (they edit `/etc/hosts` directly) and require root, since editing `/etc/hosts` needs the same privileges as binding port 443.
 
 ## Development
 

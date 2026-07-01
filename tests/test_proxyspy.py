@@ -4,6 +4,7 @@ import os
 import shutil
 import socket
 import ssl
+import subprocess
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -1048,3 +1049,273 @@ def test_chown_to_sudo_user_noop_when_not_sudo(monkeypatch, tmp_path):
 
     proxyspy._chown_to_sudo_user(str(tmp_path))
     assert called == []
+
+
+#
+# /etc/hosts management (--manage-hosts / --restore-hosts)
+#
+
+
+def test_strip_managed_block_absent():
+    text = "127.0.0.1 localhost\n::1 localhost\n"
+    assert proxyspy._strip_managed_block(text) == text
+
+
+def test_strip_managed_block_present():
+    text = (
+        "127.0.0.1 localhost\n"
+        "# >>> proxyspy >>>\n"
+        "# Managed by proxyspy (PID 123). Do not edit by hand.\n"
+        "127.0.0.1 example.com\n"
+        "# <<< proxyspy <<<\n"
+        "::1 localhost\n"
+    )
+    assert proxyspy._strip_managed_block(text) == "127.0.0.1 localhost\n::1 localhost\n"
+
+
+def test_strip_managed_block_at_start():
+    text = "# >>> proxyspy >>>\n127.0.0.1 example.com\n# <<< proxyspy <<<\n::1 localhost\n"
+    assert proxyspy._strip_managed_block(text) == "::1 localhost\n"
+
+
+def test_strip_managed_block_at_end():
+    text = "127.0.0.1 localhost\n# >>> proxyspy >>>\n127.0.0.1 example.com\n# <<< proxyspy <<<\n"
+    assert proxyspy._strip_managed_block(text) == "127.0.0.1 localhost\n"
+
+
+def test_strip_managed_block_no_trailing_newline():
+    text = "127.0.0.1 localhost\n# >>> proxyspy >>>\n127.0.0.1 example.com\n# <<< proxyspy <<<"
+    assert proxyspy._strip_managed_block(text) == "127.0.0.1 localhost\n"
+
+
+def test_strip_managed_block_two_blocks():
+    text = (
+        "# >>> proxyspy >>>\n127.0.0.1 a.com\n# <<< proxyspy <<<\n"
+        "127.0.0.1 localhost\n"
+        "# >>> proxyspy >>>\n127.0.0.1 b.com\n# <<< proxyspy <<<\n"
+    )
+    assert proxyspy._strip_managed_block(text) == "127.0.0.1 localhost\n"
+
+
+def test_strip_managed_block_unterminated_begin():
+    """A hand-corrupted file with a begin marker but no matching end marker
+    is left untouched rather than swallowing the rest of the file."""
+    text = "127.0.0.1 localhost\n# >>> proxyspy >>>\n127.0.0.1 example.com\n"
+    assert proxyspy._strip_managed_block(text) == text
+
+
+def test_write_managed_hosts_appends_block(tmp_path):
+    hosts_path = tmp_path / "hosts"
+    bak_path = tmp_path / "hosts.bak"
+    hosts_path.write_text("127.0.0.1 localhost\n")
+
+    proxyspy.write_managed_hosts(
+        ["example.com", "example.org"], hosts_path=str(hosts_path), bak_path=str(bak_path)
+    )
+
+    text = hosts_path.read_text()
+    assert text.startswith("127.0.0.1 localhost\n")
+    assert "# >>> proxyspy >>>" in text
+    assert "# <<< proxyspy <<<" in text
+    assert "127.0.0.1 example.com" in text
+    assert "127.0.0.1 example.org" in text
+    # Hosts are sorted within the block
+    assert text.index("example.com") < text.index("example.org")
+
+
+def test_write_managed_hosts_idempotent_across_restarts(tmp_path):
+    hosts_path = tmp_path / "hosts"
+    bak_path = tmp_path / "hosts.bak"
+    hosts_path.write_text("127.0.0.1 localhost\n")
+
+    proxyspy.write_managed_hosts(
+        ["example.com"], hosts_path=str(hosts_path), bak_path=str(bak_path)
+    )
+    proxyspy.write_managed_hosts(
+        ["example.org"], hosts_path=str(hosts_path), bak_path=str(bak_path)
+    )
+
+    text = hosts_path.read_text()
+    assert text.count("# >>> proxyspy >>>") == 1
+    assert "example.com" not in text
+    assert "127.0.0.1 example.org" in text
+    assert text.startswith("127.0.0.1 localhost\n")
+
+
+def test_write_managed_hosts_backs_up_once(tmp_path):
+    hosts_path = tmp_path / "hosts"
+    bak_path = tmp_path / "hosts.bak"
+    original = "127.0.0.1 localhost\n"
+    hosts_path.write_text(original)
+
+    proxyspy.write_managed_hosts(
+        ["example.com"], hosts_path=str(hosts_path), bak_path=str(bak_path)
+    )
+    assert bak_path.read_text() == original
+
+    proxyspy.write_managed_hosts(
+        ["example.org"], hosts_path=str(hosts_path), bak_path=str(bak_path)
+    )
+    assert bak_path.read_text() == original
+
+
+def test_remove_managed_hosts_restores_original(tmp_path):
+    hosts_path = tmp_path / "hosts"
+    bak_path = tmp_path / "hosts.bak"
+    original = "127.0.0.1 localhost\n::1 localhost\n"
+    hosts_path.write_text(original)
+
+    proxyspy.write_managed_hosts(
+        ["example.com"], hosts_path=str(hosts_path), bak_path=str(bak_path)
+    )
+    assert proxyspy.remove_managed_hosts(hosts_path=str(hosts_path)) is True
+    assert hosts_path.read_text() == original
+
+
+def test_remove_managed_hosts_noop_when_absent(tmp_path):
+    hosts_path = tmp_path / "hosts"
+    original = "127.0.0.1 localhost\n"
+    hosts_path.write_text(original)
+
+    assert proxyspy.remove_managed_hosts(hosts_path=str(hosts_path)) is False
+    assert hosts_path.read_text() == original
+
+
+@pytest.mark.skipif(os.name != "posix", reason="permission bits are POSIX-only")
+def test_atomic_write_preserves_permissions(tmp_path):
+    hosts_path = tmp_path / "hosts"
+    bak_path = tmp_path / "hosts.bak"
+    hosts_path.write_text("127.0.0.1 localhost\n")
+    os.chmod(hosts_path, 0o644)
+
+    proxyspy.write_managed_hosts(
+        ["example.com"], hosts_path=str(hosts_path), bak_path=str(bak_path)
+    )
+
+    assert (os.stat(hosts_path).st_mode & 0o777) == 0o644
+
+
+def _run_proxyspy_cli(*extra_args):
+    """Invoke proxyspy directly (no proxy startup) to check argparse validation."""
+    cmd = ["python", find_proxyspy()] + list(extra_args)
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+
+
+def test_manage_hosts_requires_reverse():
+    result = _run_proxyspy_cli("--manage-hosts", "--", "echo", "hi")
+    assert result.returncode == 2
+    assert "--manage-hosts requires --reverse" in result.stderr
+
+
+def test_restore_hosts_rejects_reverse():
+    result = _run_proxyspy_cli("--restore-hosts", "--reverse")
+    assert result.returncode == 2
+    assert "--restore-hosts is standalone" in result.stderr
+
+
+def test_restore_hosts_rejects_command():
+    result = _run_proxyspy_cli("--restore-hosts", "--", "echo", "hi")
+    assert result.returncode == 2
+    assert "--restore-hosts is standalone" in result.stderr
+
+
+@pytest.mark.skipif(
+    os.name == "posix" and os.geteuid() == 0, reason="already root; the check can't fire"
+)
+def test_restore_hosts_requires_root():
+    result = _run_proxyspy_cli("--restore-hosts")
+    assert result.returncode == 2
+    assert "requires root" in result.stderr
+    assert "modifying /etc/hosts" in result.stderr
+
+
+@pytest.mark.skipif(
+    os.name == "posix" and os.geteuid() == 0, reason="already root; the check can't fire"
+)
+def test_reverse_default_port_requires_root():
+    """--reverse with no explicit --port defaults to 443, a privileged port."""
+    result = _run_proxyspy_cli("--reverse", "--prepare-host", "example.com")
+    assert result.returncode == 2
+    assert "requires root" in result.stderr
+    assert "binding privileged port 443" in result.stderr
+
+
+@pytest.mark.skipif(
+    os.name == "posix" and os.geteuid() == 0, reason="already root; the check can't fire"
+)
+def test_reverse_manage_hosts_requires_root_for_both_reasons():
+    result = _run_proxyspy_cli("--reverse", "--manage-hosts", "--intercept-host", "example.com")
+    assert result.returncode == 2
+    assert "modifying /etc/hosts" in result.stderr
+    assert "binding privileged port 443" in result.stderr
+
+
+def _hosts_integration_skip_reason():
+    if os.name != "posix":
+        return "requires POSIX"
+    if os.geteuid() != 0:
+        return "requires root"
+    if os.environ.get("PROXYSPY_TEST_HOSTS") != "1":
+        return "set PROXYSPY_TEST_HOSTS=1 to run (mutates real /etc/hosts)"
+    return None
+
+
+@pytest.mark.skipif(
+    _hosts_integration_skip_reason() is not None, reason=_hosts_integration_skip_reason() or ""
+)
+class TestManageHostsIntegration:
+    """Root-gated, opt-in tests that mutate the real /etc/hosts. Runs in CI
+    on non-Windows runners via a dedicated sudo step; run locally with:
+    sudo PROXYSPY_TEST_HOSTS=1 pytest -v tests -k ManageHostsIntegration
+    """
+
+    HOST = "proxyspy-test-host.invalid"
+
+    def test_lifecycle(self, tmp_path):
+        original = Path(proxyspy.HOSTS_PATH).read_text()
+        harness = ReverseHarness(tmp_path)
+        try:
+            harness.start(
+                "--manage-hosts",
+                "--intercept-host",
+                self.HOST,
+                "--return-code",
+                "418",
+            )
+            hosts_text = Path(proxyspy.HOSTS_PATH).read_text()
+            assert "# >>> proxyspy >>>" in hosts_text
+            assert f"127.0.0.1 {self.HOST}" in hosts_text
+
+            sock = harness.connect(self.HOST)
+            sock.sendall(
+                f"GET / HTTP/1.1\r\nHost: {self.HOST}\r\nConnection: close\r\n\r\n".encode()
+            )
+            response = sock.recv(4096)
+            sock.close()
+            assert b"418" in response
+        finally:
+            harness.stop()
+
+        assert Path(proxyspy.HOSTS_PATH).read_text() == original
+
+    def test_self_heal_after_sigkill(self, tmp_path):
+        original = Path(proxyspy.HOSTS_PATH).read_text()
+        harness = ReverseHarness(tmp_path)
+        try:
+            harness.start("--manage-hosts", "--intercept-host", self.HOST)
+            assert "# >>> proxyspy >>>" in Path(proxyspy.HOSTS_PATH).read_text()
+
+            harness.process.kill()
+            harness.process.wait(timeout=5)
+            assert "# >>> proxyspy >>>" in Path(proxyspy.HOSTS_PATH).read_text()
+
+            harness2 = ReverseHarness(tmp_path)
+            try:
+                harness2.start("--manage-hosts", "--intercept-host", self.HOST)
+                assert "Self-heal: removed a stale /etc/hosts block" in harness2.logs()
+            finally:
+                harness2.stop()
+        finally:
+            harness.stop()
+
+        assert Path(proxyspy.HOSTS_PATH).read_text() == original

@@ -33,6 +33,8 @@ Arguments:
     --intercept-host HOST Only intercept requests to HOST (can repeat)
     --prepare-host HOST   Pre-generate the certificate for HOST (can repeat)
     --reverse             Standalone reverse/transparent proxy (no command)
+    --manage-hosts        Auto-manage /etc/hosts redirects (reverse mode; POSIX only)
+    --restore-hosts       Remove any proxyspy-managed /etc/hosts block and exit
     --cert-dir DIR        Persistent certificate directory (reverse: ~/.proxyspy)
     --map HOST=IP         Pin the real upstream IP for HOST (reverse; can repeat)
     --upstream-port PORT  Upstream port to dial in reverse mode (default: 443)
@@ -61,8 +63,10 @@ import atexit
 import ipaddress
 import logging
 import os
+import re
 import select
 import shutil
+import signal
 import socket
 import socketserver
 import ssl
@@ -616,6 +620,104 @@ def _chown_to_sudo_user(path):
                 logger.debug("Could not chown %s to %s: %s", target, pw.pw_name, exc)
 
 
+#
+# /etc/hosts management (--manage-hosts / --restore-hosts)
+#
+
+HOSTS_PATH = "/etc/hosts"
+HOSTS_BAK = "/etc/hosts.proxyspy.bak"
+FENCE_BEGIN = "# >>> proxyspy >>>"
+FENCE_END = "# <<< proxyspy <<<"
+
+# Non-greedy + DOTALL so multiple blocks are each stripped individually. An
+# unmatched FENCE_BEGIN (no following FENCE_END) is deliberately left alone
+# rather than consuming the rest of the file.
+_MANAGED_BLOCK_RE = re.compile(
+    re.escape(FENCE_BEGIN) + r".*?" + re.escape(FENCE_END) + r"\n?", re.DOTALL
+)
+
+
+def _strip_managed_block(text):
+    """Remove the fenced proxyspy block(s) from text, if present. Pure
+    string in/string out so it is trivially unit-testable; idempotent if no
+    block is present."""
+    return _MANAGED_BLOCK_RE.sub("", text)
+
+
+def _fenced_block(hosts):
+    """Build the fenced block text (including trailing newline) for hosts."""
+    lines = [FENCE_BEGIN, "# Managed by proxyspy (PID %d). Do not edit by hand." % os.getpid()]
+    lines.extend("127.0.0.1 %s" % host for host in sorted(hosts))
+    lines.append(FENCE_END)
+    return "\n".join(lines) + "\n"
+
+
+def _atomic_write(path, text):
+    """Write text to path atomically: temp file in the same directory,
+    flush+fsync, then os.replace() so the file is never observed
+    half-written.
+
+    mkstemp creates the temp file mode 0600; without correcting that before
+    os.replace(), the live file would silently become unreadable by every
+    unprivileged process. Match path's existing mode (falling back to 0644
+    if it doesn't exist yet, e.g. a fresh file in tests). Ownership is left
+    as-is (whoever runs proxyspy), which is correct since reverse mode
+    already needs root for port 443.
+    """
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".proxyspy-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            mode = os.stat(path).st_mode & 0o777
+        except FileNotFoundError:
+            mode = 0o644
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def write_managed_hosts(hosts, hosts_path=HOSTS_PATH, bak_path=HOSTS_BAK):
+    """Write the fenced managed block for hosts into hosts_path, replacing
+    any existing block. Backs up hosts_path to bak_path once, on first
+    mutation; the backup is never overwritten or touched by removal."""
+    try:
+        with open(hosts_path) as f:
+            current = f.read()
+    except FileNotFoundError:
+        current = ""
+    else:
+        if not os.path.exists(bak_path):
+            shutil.copy2(hosts_path, bak_path)
+    stripped = _strip_managed_block(current)
+    if stripped and not stripped.endswith("\n"):
+        stripped += "\n"
+    _atomic_write(hosts_path, stripped + _fenced_block(hosts))
+
+
+def remove_managed_hosts(hosts_path=HOSTS_PATH):
+    """Strip the managed block from hosts_path if present. Returns True if
+    a block was found and removed, False if the file was already clean."""
+    try:
+        with open(hosts_path) as f:
+            current = f.read()
+    except FileNotFoundError:
+        return False
+    stripped = _strip_managed_block(current)
+    if stripped == current:
+        return False
+    _atomic_write(hosts_path, stripped)
+    return True
+
+
 def configure_intercept(server, args):
     """Apply --return-* / --intercept-host options to a server. Returns False
     on a malformed --return-header."""
@@ -678,6 +780,18 @@ def main():
         "target hostnames to 127.0.0.1 in /etc/hosts.",
     )
     parser.add_argument(
+        "--manage-hosts",
+        action="store_true",
+        help="Automatically add/remove the /etc/hosts redirects for the declared "
+        "hosts for the lifetime of this run (reverse mode only; POSIX only).",
+    )
+    parser.add_argument(
+        "--restore-hosts",
+        action="store_true",
+        help="Remove any proxyspy-managed block from /etc/hosts and exit "
+        "(standalone; POSIX only; does not require --reverse).",
+    )
+    parser.add_argument(
         "--cert-dir",
         help="Directory for the persistent CA and host certificates "
         "(reverse mode default: ~/.proxyspy)",
@@ -725,10 +839,39 @@ def main():
     args = parser.parse_args()
 
     # Validate mode/command combination
+    if (args.manage_hosts or args.restore_hosts) and os.name != "posix":
+        parser.error(
+            "--manage-hosts/--restore-hosts are POSIX-only; edit /etc/hosts manually "
+            "on this platform"
+        )
+    if args.manage_hosts and not args.reverse:
+        parser.error("--manage-hosts requires --reverse")
+    if args.restore_hosts and (args.reverse or args.command):
+        parser.error(
+            "--restore-hosts is standalone and cannot be combined with --reverse or a command"
+        )
     if args.reverse and args.command:
         parser.error("a command cannot be given in --reverse mode")
-    if not args.reverse and not args.command:
+    if not args.reverse and not args.restore_hosts and not args.command:
         parser.error("a command is required (or use --reverse for standalone mode)")
+
+    # Fail fast and cleanly if this invocation needs root, rather than
+    # surfacing a raw PermissionError partway through startup (binding port
+    # 443, or writing /etc/hosts).
+    if os.name == "posix" and os.geteuid() != 0:
+        if args.port is None:
+            port_needed = 443 if args.reverse else None
+        elif args.port == 0:
+            port_needed = None  # auto-select always lands on an unprivileged port
+        else:
+            port_needed = args.port
+        reasons = []
+        if args.manage_hosts or args.restore_hosts:
+            reasons.append("modifying /etc/hosts")
+        if args.reverse and port_needed is not None and port_needed < 1024:
+            reasons.append("binding privileged port %d" % port_needed)
+        if reasons:
+            parser.error("this requires root (sudo): %s" % " and ".join(reasons))
 
     # Parse --map HOST=IP overrides
     overrides = {}
@@ -752,6 +895,19 @@ def main():
 
     # Log version info immediately after logging setup
     logger.info("ProxySpy version %s", __version__)
+
+    # --restore-hosts is standalone and needs no certs/port/server setup.
+    if args.restore_hosts:
+        try:
+            removed = remove_managed_hosts()
+        except PermissionError as exc:
+            logger.error("Cannot modify /etc/hosts: %s", exc)
+            return 1
+        if removed:
+            logger.info("Removed proxyspy-managed block from /etc/hosts")
+        else:
+            logger.info("No proxyspy-managed block found in /etc/hosts; nothing to do")
+        return 0
 
     # Set up certificate generation. Reverse mode persists certificates so the
     # CA can be trusted once and reused; forward mode keeps the old behavior.
@@ -797,6 +953,18 @@ def main():
     # Reverse/transparent mode: serve in the foreground until interrupted.
     if args.reverse:
         server.base_context = make_sni_context()
+
+        # Self-heal before resolving: a managed block left behind by a prior
+        # run that died uncleanly (e.g. SIGKILL) would make the OS resolver
+        # return our own loopback address instead of the real upstream.
+        if args.manage_hosts:
+            try:
+                if remove_managed_hosts():
+                    logger.info("Self-heal: removed a stale /etc/hosts block from a previous run")
+            except PermissionError as exc:
+                logger.error("Cannot modify /etc/hosts: %s", exc)
+                return 1
+
         # A host that is always intercepted never connects upstream, so skip
         # resolving it (avoids a needless lookup and the loopback guard firing).
         intercept_all = server.intercept_mode and not server.intercept_hosts
@@ -811,17 +979,44 @@ def main():
             logger.info("Upstream for %s -> %s:%d", host, *server.upstream[host])
         logger.info("Reverse proxy listening on 127.0.0.1:%d", port)
         logger.info("Trust the CA certificate at: %s", cert_path)
-        logger.info(
-            "Redirect these hosts to 127.0.0.1 in /etc/hosts: %s",
-            ", ".join(sorted(declared_hosts)) or "(none declared)",
-        )
+        if not args.manage_hosts:
+            logger.info(
+                "Redirect these hosts to 127.0.0.1 in /etc/hosts: %s",
+                ", ".join(sorted(declared_hosts)) or "(none declared)",
+            )
+
+        if args.manage_hosts:
+            if not declared_hosts:
+                logger.warning("--manage-hosts has no declared hosts to write; skipping")
+            else:
+                try:
+                    write_managed_hosts(declared_hosts)
+                except PermissionError as exc:
+                    logger.error("Cannot modify /etc/hosts: %s", exc)
+                    return 1
+                logger.info(
+                    "Added /etc/hosts redirects for: %s (will be removed on exit)",
+                    ", ".join(sorted(declared_hosts)),
+                )
+
+                def _handle_sigterm(signum, frame):
+                    raise SystemExit(0)
+
+                signal.signal(signal.SIGTERM, _handle_sigterm)
+
         try:
             server.serve_forever()
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, SystemExit):
             logger.info("Interrupted; shutting down")
         finally:
             server.shutdown()
             server.server_close()
+            if args.manage_hosts:
+                try:
+                    if remove_managed_hosts():
+                        logger.info("Removed /etc/hosts redirects")
+                except PermissionError as exc:
+                    logger.error("Failed to remove /etc/hosts redirects: %s", exc)
         return 0
 
     server_thread = Thread(target=server.serve_forever)
