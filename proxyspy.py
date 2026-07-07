@@ -81,7 +81,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 # Modified by our pre-commit hook
-__version__ = "0.1.5.post27"
+__version__ = "0.1.5.post34"
 
 # _forward_data buffer size
 BUFFER_SIZE = 65536
@@ -577,16 +577,43 @@ def resolve_upstream(host, port, overrides):
     return ip, port
 
 
+def _sudo_pw():
+    """pwd entry for the invoking user when running under sudo, or None if not
+    under sudo (or not on a POSIX system, or the user no longer exists)."""
+    if os.name != "posix":
+        return None
+    sudo_user = os.environ.get("SUDO_USER")
+    if not sudo_user:
+        return None
+    import pwd
+
+    try:
+        return pwd.getpwnam(sudo_user)
+    except KeyError:
+        return None
+
+
 def default_cert_dir():
     """~/.proxyspy, resolving the invoking user's home even under sudo."""
-    sudo_user = os.environ.get("SUDO_USER")
-    if sudo_user:
-        import pwd
-
-        home = pwd.getpwnam(sudo_user).pw_dir
-    else:
-        home = os.path.expanduser("~")
+    pw = _sudo_pw()
+    home = pw.pw_dir if pw else os.path.expanduser("~")
     return join(home, ".proxyspy")
+
+
+def _chown_to_sudo_user(path):
+    """When running as root under sudo, hand the persistent cert directory and
+    its contents to the invoking user, so the CA stays readable/writable from
+    their normal unprivileged sessions rather than being locked to root. This
+    also repairs a directory left root-owned by an earlier run."""
+    pw = _sudo_pw()
+    if pw is None or os.geteuid() != 0:
+        return
+    for root, dirs, files in os.walk(path):
+        for target in [root] + [join(root, name) for name in dirs + files]:
+            try:
+                os.chown(target, pw.pw_uid, pw.pw_gid)
+            except OSError as exc:
+                logger.debug("Could not chown %s to %s: %s", target, pw.pw_name, exc)
 
 
 def configure_intercept(server, args):
@@ -728,7 +755,8 @@ def main():
 
     # Set up certificate generation. Reverse mode persists certificates so the
     # CA can be trusted once and reused; forward mode keeps the old behavior.
-    if args.cert_dir or args.reverse:
+    persistent_certs = bool(args.cert_dir or args.reverse)
+    if persistent_certs:
         CERT_DIR = args.cert_dir or default_cert_dir()
         os.makedirs(CERT_DIR, exist_ok=True)
     elif args.keep_certs:
@@ -746,6 +774,12 @@ def main():
     declared_hosts = set(args.intercept_host or ()) | set(args.prepare_host or ())
     for host in declared_hosts:
         read_or_create_cert(host)
+
+    # Under sudo, the persistent cert dir and the certs just written into it are
+    # owned by root; hand them back to the invoking user so their unprivileged
+    # sessions can still read the CA (and so a later non-sudo run can write here).
+    if persistent_certs:
+        _chown_to_sudo_user(CERT_DIR)
 
     # Select the listen port (reverse mode defaults to 443; 0 = auto-select)
     if args.port is None:

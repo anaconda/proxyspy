@@ -24,6 +24,8 @@ from requests.adapters import HTTPAdapter
 from requests.exceptions import ConnectionError, ProxyError, ReadTimeout, RequestException
 from urllib3.util.retry import MaxRetryError, Retry
 
+import proxyspy
+
 EXCEPTIONS = ConnectionError, ProxyError, ReadTimeout, RequestException, MaxRetryError
 
 # Hostname the forwarding tests use for the in-process origin. It resolves to
@@ -1004,3 +1006,43 @@ def test_reverse_loopback_guard(reverse):
 
     assert reverse.process.returncode == 1
     assert "loopback address" in reverse.logs()
+
+
+#
+# Persistent cert-dir ownership under sudo
+#
+
+
+def test_default_cert_dir_uses_sudo_user_home(monkeypatch):
+    """Under sudo the persistent dir must resolve to the invoking user's home,
+    not root's, so the CA lands where the user can trust it."""
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setenv("SUDO_USER", "someuser")
+
+    class _PW:
+        pw_dir = "/home/someuser"
+        pw_uid = 1000
+        pw_gid = 1000
+        pw_name = "someuser"
+
+    import pwd
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: _PW if name == "someuser" else 1 / 0)
+    assert proxyspy.default_cert_dir() == os.path.join("/home/someuser", ".proxyspy")
+
+
+def test_sudo_pw_none_without_sudo(monkeypatch):
+    monkeypatch.delenv("SUDO_USER", raising=False)
+    assert proxyspy._sudo_pw() is None
+
+
+def test_chown_to_sudo_user_noop_when_not_sudo(monkeypatch, tmp_path):
+    """Without SUDO_USER the chown helper must do nothing (and never touch the
+    filesystem), so ordinary non-sudo runs are unaffected."""
+    monkeypatch.delenv("SUDO_USER", raising=False)
+    called = []
+    monkeypatch.setattr(os, "chown", lambda *a, **k: called.append(a))
+    (tmp_path / "cert.pem").write_text("x")
+
+    proxyspy._chown_to_sudo_user(str(tmp_path))
+    assert called == []
