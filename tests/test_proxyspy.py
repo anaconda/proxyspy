@@ -1,6 +1,7 @@
 import ipaddress
 import json
 import os
+import shlex
 import shutil
 import socket
 import ssl
@@ -1170,9 +1171,12 @@ def test_standalone_writes_env_file_and_banner(standalone):
     assert env_file.exists(), "env file should exist while running"
     contents = env_file.read_text()
     proxy_url = standalone.proxy_url()
-    assert f"export HTTPS_PROXY={proxy_url}" in contents
-    assert f"export SSL_CERT_FILE={standalone.ca_path}" in contents
-    assert f"export CONDA_SSL_VERIFY={standalone.ca_path}" in contents
+    # Values are shell-quoted (shlex.quote), which matters on Windows where the
+    # cert path contains backslashes and gets wrapped in single quotes.
+    ca = shlex.quote(standalone.ca_path)
+    assert f"export HTTPS_PROXY={shlex.quote(proxy_url)}" in contents
+    assert f"export SSL_CERT_FILE={ca}" in contents
+    assert f"export CONDA_SSL_VERIFY={ca}" in contents
     # Empty NO_PROXY must be shell-quoted so `source` doesn't choke.
     assert "export NO_PROXY=''" in contents
 
@@ -1182,8 +1186,8 @@ def test_standalone_writes_env_file_and_banner(standalone):
     # The banner went to stdout with the same values, ready to copy-paste.
     banner = standalone.stdout
     assert "ProxySpy standalone (forward proxy) listening" in banner
-    assert f"export HTTPS_PROXY={proxy_url}" in banner
-    assert f"source {env_file}" in banner
+    assert f"export HTTPS_PROXY={shlex.quote(proxy_url)}" in banner
+    assert f"source {shlex.quote(str(env_file))}" in banner
 
 
 def test_standalone_banner_survives_unwritable_env_file(standalone):
@@ -1202,7 +1206,7 @@ def test_standalone_banner_survives_unwritable_env_file(standalone):
     assert "Cannot write env file" in standalone.logs()
     banner = standalone.stdout
     assert "ProxySpy standalone (forward proxy) listening" in banner
-    assert f"export HTTPS_PROXY={proxy_url}" in banner
+    assert f"export HTTPS_PROXY={shlex.quote(proxy_url)}" in banner
     # No source-able file, so that line is omitted rather than pointing nowhere.
     assert "source " not in banner
 
