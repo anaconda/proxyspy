@@ -1299,10 +1299,12 @@ class TestManageHostsIntegration:
         assert Path(proxyspy.HOSTS_PATH).read_text() == original
 
     def test_self_heal_after_sigkill(self, tmp_path):
+        # --return-code makes HOST intercept-only, so proxyspy never tries to
+        # resolve the unresolvable .invalid upstream at startup.
         original = Path(proxyspy.HOSTS_PATH).read_text()
         harness = ReverseHarness(tmp_path)
         try:
-            harness.start("--manage-hosts", "--intercept-host", self.HOST)
+            harness.start("--manage-hosts", "--intercept-host", self.HOST, "--return-code", "418")
             assert "# >>> proxyspy >>>" in Path(proxyspy.HOSTS_PATH).read_text()
 
             harness.process.kill()
@@ -1311,7 +1313,9 @@ class TestManageHostsIntegration:
 
             harness2 = ReverseHarness(tmp_path)
             try:
-                harness2.start("--manage-hosts", "--intercept-host", self.HOST)
+                harness2.start(
+                    "--manage-hosts", "--intercept-host", self.HOST, "--return-code", "418"
+                )
                 assert "Self-heal: removed a stale /etc/hosts block" in harness2.logs()
             finally:
                 harness2.stop()

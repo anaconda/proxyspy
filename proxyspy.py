@@ -85,7 +85,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 # Modified by our pre-commit hook
-__version__ = "0.1.5.post35"
+__version__ = "0.1.5.post37"
 
 # _forward_data buffer size
 BUFFER_SIZE = 65536
@@ -977,15 +977,16 @@ def main():
                 logger.error("Cannot resolve upstream for %s: %s", host, exc)
                 return 1
             logger.info("Upstream for %s -> %s:%d", host, *server.upstream[host])
-        logger.info("Reverse proxy listening on 127.0.0.1:%d", port)
-        logger.info("Trust the CA certificate at: %s", cert_path)
+
+        # Install the /etc/hosts redirects (or print instructions) *before*
+        # announcing that we are listening: callers that wait for the "listening"
+        # line then read /etc/hosts would otherwise race the write.
         if not args.manage_hosts:
             logger.info(
                 "Redirect these hosts to 127.0.0.1 in /etc/hosts: %s",
                 ", ".join(sorted(declared_hosts)) or "(none declared)",
             )
-
-        if args.manage_hosts:
+        else:
             if not declared_hosts:
                 logger.warning("--manage-hosts has no declared hosts to write; skipping")
             else:
@@ -1003,6 +1004,9 @@ def main():
                     raise SystemExit(0)
 
                 signal.signal(signal.SIGTERM, _handle_sigterm)
+
+        logger.info("Reverse proxy listening on 127.0.0.1:%d", port)
+        logger.info("Trust the CA certificate at: %s", cert_path)
 
         try:
             server.serve_forever()
