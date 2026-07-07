@@ -94,7 +94,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 # Modified by our pre-commit hook
-__version__ = "0.1.5.post42"
+__version__ = "0.1.5.post43"
 
 # _forward_data buffer size
 BUFFER_SIZE = 65536
@@ -1117,7 +1117,9 @@ def main():
         print_standalone_banner(port, proxy_env, env_file)
 
         # Convert SIGTERM into a clean shutdown so the env file is removed even
-        # when the process is stopped with `kill` rather than Ctrl-C.
+        # when the process is stopped with `kill` rather than Ctrl-C. On Windows
+        # there is no catchable SIGTERM (TerminateProcess is an unconditional
+        # kill), so a `taskkill` may leave the env file behind until the next run.
         if os.name == "posix":
 
             def _handle_sigterm(signum, frame):

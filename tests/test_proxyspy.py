@@ -1181,7 +1181,12 @@ def test_standalone_writes_env_file_and_banner(standalone):
     assert "export NO_PROXY=''" in contents
 
     standalone.stop()
-    assert not env_file.exists(), "env file should be removed on shutdown"
+    # On POSIX, stop() sends SIGTERM which proxyspy converts to a clean shutdown
+    # that removes the env file. On Windows, terminate() maps to TerminateProcess
+    # (an uncatchable hard kill), so the file may persist until the next run; we
+    # don't assert removal there.
+    if os.name == "posix":
+        assert not env_file.exists(), "env file should be removed on shutdown"
 
     # The banner went to stdout with the same values, ready to copy-paste.
     banner = standalone.stdout
