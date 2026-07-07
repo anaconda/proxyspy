@@ -85,7 +85,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 # Modified by our pre-commit hook
-__version__ = "0.1.5.post37"
+__version__ = "0.1.5.post38"
 
 # _forward_data buffer size
 BUFFER_SIZE = 65536

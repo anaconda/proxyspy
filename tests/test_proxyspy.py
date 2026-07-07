@@ -871,6 +871,12 @@ class ReverseHarness:
         ]
         cmd += list(extra_args)
         print(f"\nStarting reverse proxy: {' '.join(cmd)}")
+        # proxyspy opens the logfile in append mode, so a second start() on the
+        # same tmp_path would see the previous run's "listening" line and return
+        # early (before this run self-heals/logs). Truncate so we only ever match
+        # this invocation's output.
+        if self.log_file.exists():
+            self.log_file.unlink()
         env = os.environ.copy()
         if trust:
             # Trust the in-process origin's cert for upstream verification.
