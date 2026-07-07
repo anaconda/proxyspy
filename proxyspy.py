@@ -6,12 +6,16 @@
 
 """HTTPS debugging proxy that logs or intercepts HTTPS requests.
 
-Runs in one of two modes:
+Runs in one of three modes:
 
 * Forward mode (default): launches a proxy server and runs a command with the
   proxy environment variables set, forwarding HTTPS requests while logging
   headers and content, or intercepting requests and returning specified
   responses.
+* Standalone forward mode (--standalone): stands up the same forward proxy but,
+  instead of launching a command, prints the environment variables to set in a
+  second terminal (and writes them to ~/.proxyspy/env for sourcing), then blocks
+  until interrupted. Useful when the client cannot run as a proxyspy subprocess.
 * Reverse mode (--reverse): runs standalone, listening on 127.0.0.1 (default
   port 443) and reading the target host from the TLS SNI field. Point the
   target hostnames at 127.0.0.1 in /etc/hosts to monitor clients that ignore
@@ -32,6 +36,7 @@ Arguments:
     --return-data DATA    Return DATA as response body
     --intercept-host HOST Only intercept requests to HOST (can repeat)
     --prepare-host HOST   Pre-generate the certificate for HOST (can repeat)
+    --standalone          Forward proxy that blocks and prints env vars (no command)
     --reverse             Standalone reverse/transparent proxy (no command)
     --manage-hosts        Auto-manage /etc/hosts redirects (reverse mode; POSIX only)
     --restore-hosts       Remove any proxyspy-managed /etc/hosts block and exit
@@ -52,6 +57,9 @@ Examples:
                   --return-data '{"status": "ok"}' \\
                   -- ./my_script.py
 
+    # Standalone forward proxy; set the printed vars in another shell:
+    ./proxyspy.py --standalone -l spy.log
+
     # Standalone reverse proxy monitoring conda traffic (run as root for 443):
     #   1. sudo ./proxyspy.py --reverse --prepare-host repo.anaconda.com -l spy.log
     #   2. trust ~/.proxyspy/cert.pem, then add "127.0.0.1 repo.anaconda.com"
@@ -65,6 +73,7 @@ import logging
 import os
 import re
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -739,6 +748,56 @@ def configure_intercept(server, args):
     return True
 
 
+def build_proxy_env(port, cert_path):
+    """Return the proxy/CA environment variables a client must set to route
+    HTTPS through this forward proxy. Shared by the subprocess launcher and the
+    --standalone banner/env-file so the two can never drift apart."""
+    proxy_host = "http://localhost:%d" % port
+    return {
+        "HTTP_PROXY": proxy_host,
+        "http_proxy": proxy_host,
+        "HTTPS_PROXY": proxy_host,
+        "https_proxy": proxy_host,
+        "NO_PROXY": "",
+        "no_proxy": "",
+        "CURL_CA_BUNDLE": cert_path,
+        "SSL_CERT_FILE": cert_path,
+        "REQUESTS_CA_BUNDLE": cert_path,
+        "CONDA_SSL_VERIFY": cert_path,
+    }
+
+
+def write_env_file(path, proxy_env):
+    """Write a source-able file of `export NAME=VALUE` lines for proxy_env."""
+    lines = [
+        "# proxyspy standalone environment; source this into another shell.",
+        "# Only valid while proxyspy is running; removed on exit.",
+    ]
+    lines += ["export %s=%s" % (name, shlex.quote(value)) for name, value in proxy_env.items()]
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def print_standalone_banner(port, proxy_env, env_file):
+    """Print copy-pasteable export lines to stdout (never the logger, so the
+    banner stays clean even when logs are redirected with --logfile)."""
+    rule = "=" * 72
+    exports = "\n".join(
+        "    export %s=%s" % (name, shlex.quote(value)) for name, value in proxy_env.items()
+    )
+    print(rule)
+    print("ProxySpy standalone (forward proxy) listening on http://localhost:%d" % port)
+    print("")
+    print("Paste into another terminal to route HTTPS through ProxySpy:")
+    print("")
+    print(exports)
+    print("")
+    print("...or just:  source %s" % shlex.quote(env_file))
+    print("")
+    print("Press Ctrl-C to stop.")
+    print(rule, flush=True)
+
+
 #
 # Command-line interface
 #
@@ -770,6 +829,14 @@ def main():
         "--keep-certs",
         action="store_true",
         help="Keep certificates in current directory instead of using a temporary directory",
+    )
+    parser.add_argument(
+        "--standalone",
+        action="store_true",
+        help="Run the forward proxy standalone: instead of launching a command, "
+        "print the proxy/CA environment variables to set in another terminal "
+        "(and write them to <cert-dir>/env for sourcing), then block until "
+        "interrupted.",
     )
     parser.add_argument(
         "--reverse",
@@ -850,10 +917,12 @@ def main():
         parser.error(
             "--restore-hosts is standalone and cannot be combined with --reverse or a command"
         )
-    if args.reverse and args.command:
-        parser.error("a command cannot be given in --reverse mode")
-    if not args.reverse and not args.restore_hosts and not args.command:
-        parser.error("a command is required (or use --reverse for standalone mode)")
+    if args.standalone and args.reverse:
+        parser.error("--standalone and --reverse are mutually exclusive")
+    if (args.reverse or args.standalone) and args.command:
+        parser.error("a command cannot be given in --reverse or --standalone mode")
+    if not args.reverse and not args.standalone and not args.restore_hosts and not args.command:
+        parser.error("a command is required (or use --standalone/--reverse for standalone mode)")
 
     # Fail fast and cleanly if this invocation needs root, rather than
     # surfacing a raw PermissionError partway through startup (binding port
@@ -911,7 +980,7 @@ def main():
 
     # Set up certificate generation. Reverse mode persists certificates so the
     # CA can be trusted once and reused; forward mode keeps the old behavior.
-    persistent_certs = bool(args.cert_dir or args.reverse)
+    persistent_certs = bool(args.cert_dir or args.reverse or args.standalone)
     if persistent_certs:
         CERT_DIR = args.cert_dir or default_cert_dir()
         os.makedirs(CERT_DIR, exist_ok=True)
@@ -1028,21 +1097,48 @@ def main():
     server_thread.start()
     logger.info("Proxy server started on port %d", port)
 
-    # Proxy configuration
-    env = os.environ.copy()
-    proxy_host = "http://localhost:%d" % port
-    env["HTTPS_PROXY"] = proxy_host
-    env["https_proxy"] = proxy_host
-    env["HTTP_PROXY"] = proxy_host
-    env["http_proxy"] = proxy_host
-    env["NO_PROXY"] = ""
-    env["no_proxy"] = ""
+    proxy_env = build_proxy_env(port, cert_path)
 
-    # Certificate configuration
-    env["CURL_CA_BUNDLE"] = cert_path
-    env["SSL_CERT_FILE"] = cert_path
-    env["REQUESTS_CA_BUNDLE"] = cert_path
-    env["CONDA_SSL_VERIFY"] = cert_path
+    # Standalone forward mode: don't launch a command. Print the env vars for a
+    # second shell, write them to a source-able file, and block until Ctrl-C.
+    if args.standalone:
+        env_file = join(CERT_DIR, "env")
+        try:
+            write_env_file(env_file, proxy_env)
+        except OSError as exc:
+            logger.error("Cannot write env file %s: %s", env_file, exc)
+            env_file = None
+        logger.info("CA environment variable value: %s", cert_path)
+        if env_file:
+            print_standalone_banner(port, proxy_env, env_file)
+
+        # Convert SIGTERM into a clean shutdown so the env file is removed even
+        # when the process is stopped with `kill` rather than Ctrl-C.
+        if os.name == "posix":
+
+            def _handle_sigterm(signum, frame):
+                raise SystemExit(0)
+
+            signal.signal(signal.SIGTERM, _handle_sigterm)
+
+        try:
+            while True:
+                time.sleep(3600)
+        except (KeyboardInterrupt, SystemExit):
+            logger.info("Interrupted; shutting down")
+        finally:
+            server.shutdown()
+            server.server_close()
+            if env_file:
+                try:
+                    os.remove(env_file)
+                except OSError:
+                    pass
+        return 0
+
+    # Proxy configuration for the child process
+    env = os.environ.copy()
+    env.update(proxy_env)
     logger.info("CA environment variable value: %s", cert_path)
 
     # Run child process

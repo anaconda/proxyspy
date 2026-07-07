@@ -82,10 +82,11 @@ The tool starts a proxy server and then runs the specified command with appropri
 - `--return-data DATA`: Return DATA as response body
 - `--intercept-host HOST`: Only intercept requests to HOST (can repeat)
 - `--prepare-host HOST`: Pre-generate the certificate for HOST to avoid first-connection delay (can repeat)
+- `--standalone`: Run the forward proxy standalone: instead of running a command, print the proxy/CA environment variables to set in another terminal (and write them to `<cert-dir>/env` for sourcing), then block until interrupted (see below)
 - `--reverse`: Run as a standalone reverse/transparent proxy instead of running a command (see below)
 - `--manage-hosts`: Automatically add/remove the `/etc/hosts` redirects for declared hosts for the run's lifetime (reverse mode only; POSIX only; see below)
 - `--restore-hosts`: Remove any proxyspy-managed block from `/etc/hosts` and exit (standalone; POSIX only)
-- `--cert-dir DIR`: Directory for the persistent CA and host certificates (reverse mode default: `~/.proxyspy`)
+- `--cert-dir DIR`: Directory for the persistent CA and host certificates (reverse and standalone mode default: `~/.proxyspy`)
 - `--map HOST=IP`: Pin the real upstream IP for HOST, bypassing DNS (reverse mode; can repeat)
 - `--upstream-port PORT`: Port to dial on the real upstream servers in reverse mode (default: 443)
 
@@ -127,6 +128,12 @@ proxyspy --return-code 404 \
          -- python conda_script.py
 ```
 
+Run the proxy standalone and drive it from a second terminal:
+
+```bash
+proxyspy --standalone -l spy.log
+```
+
 ## How It Works
 
 The proxy operates in two modes and can optionally add delays to any connection:
@@ -135,6 +142,7 @@ The proxy operates in two modes and can optionally add delays to any connection:
 - Creates a CA certificate and per-host certificates
 - Establishes SSL tunnels to requested hosts
 - Logs all traffic passing through
+- Runs a command as a subprocess, or blocks standalone with `--standalone` (see [Standalone Forward Mode](#standalone-forward-mode))
 
 ### Interception Mode
 - Activated by specifying any of: --return-code, --return-data, --return-header
@@ -150,6 +158,42 @@ The proxy operates in two modes and can optionally add delays to any connection:
 - By default, the proxy automatically selects an available port
 - This prevents socket reuse issues and allows running multiple instances
 - A specific port can be chosen with the --port option
+
+## Standalone Forward Mode
+
+`--standalone` runs the ordinary forward proxy, but instead of launching a command as a subprocess it prints the environment variables a client needs, writes them to a source-able file, and blocks until you press Ctrl-C. Use it when the client you want to watch cannot run as a proxyspy subprocess — for example a long-lived service, an IDE, or a shell session you drive by hand.
+
+On startup it prints a copy-pasteable banner to stdout (always, even with `-l`/`--logfile`), and writes the same `export` lines to `<cert-dir>/env` (default `~/.proxyspy/env`):
+
+```
+========================================================================
+ProxySpy standalone (forward proxy) listening on http://localhost:54321
+
+Paste into another terminal to route HTTPS through ProxySpy:
+
+    export HTTP_PROXY=http://localhost:54321
+    export HTTPS_PROXY=http://localhost:54321
+    ...
+    export SSL_CERT_FILE=/Users/you/.proxyspy/cert.pem
+    export CONDA_SSL_VERIFY=/Users/you/.proxyspy/cert.pem
+
+...or just:  source /Users/you/.proxyspy/env
+
+Press Ctrl-C to stop.
+========================================================================
+```
+
+Workflow:
+
+* In terminal 1, start the proxy: `proxyspy --standalone -l spy.log`.
+* In terminal 2, either paste the printed `export` lines or run `source ~/.proxyspy/env`, then run your client. Its HTTPS traffic is now proxied and logged to `spy.log`.
+* Press Ctrl-C in terminal 1 to stop. The env file is removed on exit so it never points at a released port.
+
+Notes:
+
+* No root is needed — standalone auto-selects an unprivileged port (unlike reverse mode, which defaults to privileged port 443).
+* Clients only trust the CA via the `*_CA_BUNDLE` / `SSL_CERT_FILE` / `CONDA_SSL_VERIFY` variables, so this exercises the *proxied* code path. Tools that ignore those variables (or bypass proxy env vars entirely) won't be intercepted; for those, use reverse mode.
+* `--cert-dir` overrides where the persistent CA and the `env` file live.
 
 ## Reverse / Transparent Mode
 
