@@ -94,7 +94,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 # Modified by our pre-commit hook
-__version__ = "0.1.5.post39"
+__version__ = "0.1.5.post42"
 
 # _forward_data buffer size
 BUFFER_SIZE = 65536
@@ -780,7 +780,8 @@ def write_env_file(path, proxy_env):
 
 def print_standalone_banner(port, proxy_env, env_file):
     """Print copy-pasteable export lines to stdout (never the logger, so the
-    banner stays clean even when logs are redirected with --logfile)."""
+    banner stays clean even when logs are redirected with --logfile). env_file
+    is the source-able file if it was written, or None if it could not be."""
     rule = "=" * 72
     exports = "\n".join(
         "    export %s=%s" % (name, shlex.quote(value)) for name, value in proxy_env.items()
@@ -791,8 +792,9 @@ def print_standalone_banner(port, proxy_env, env_file):
     print("Paste into another terminal to route HTTPS through ProxySpy:")
     print("")
     print(exports)
-    print("")
-    print("...or just:  source %s" % shlex.quote(env_file))
+    if env_file:
+        print("")
+        print("...or just:  source %s" % shlex.quote(env_file))
     print("")
     print("Press Ctrl-C to stop.")
     print(rule, flush=True)
@@ -1109,8 +1111,10 @@ def main():
             logger.error("Cannot write env file %s: %s", env_file, exc)
             env_file = None
         logger.info("CA environment variable value: %s", cert_path)
-        if env_file:
-            print_standalone_banner(port, proxy_env, env_file)
+        # Always print the banner (the copy-pasteable exports are the primary
+        # UX); env_file is None here if the source-able file could not be
+        # written, in which case the "or just: source ..." line is omitted.
+        print_standalone_banner(port, proxy_env, env_file)
 
         # Convert SIGTERM into a clean shutdown so the env file is removed even
         # when the process is stopped with `kill` rather than Ctrl-C.

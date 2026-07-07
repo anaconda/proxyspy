@@ -1186,6 +1186,27 @@ def test_standalone_writes_env_file_and_banner(standalone):
     assert f"source {env_file}" in banner
 
 
+def test_standalone_banner_survives_unwritable_env_file(standalone):
+    """If the env file cannot be written (e.g. a root-owned ~/.proxyspy from a
+    prior sudo run), the copy-pasteable banner must still print; only the
+    'source ...' line is dropped."""
+    # Pre-create <cert-dir>/env as a directory so open(path, "w") fails with an
+    # OSError, without needing to fiddle with ownership or permissions.
+    standalone.cert_dir.mkdir(parents=True, exist_ok=True)
+    (standalone.cert_dir / "env").mkdir()
+
+    standalone.start()
+    proxy_url = standalone.proxy_url()
+    standalone.stop()
+
+    assert "Cannot write env file" in standalone.logs()
+    banner = standalone.stdout
+    assert "ProxySpy standalone (forward proxy) listening" in banner
+    assert f"export HTTPS_PROXY={proxy_url}" in banner
+    # No source-able file, so that line is omitted rather than pointing nowhere.
+    assert "source " not in banner
+
+
 def test_standalone_forwards_request(standalone, origin):
     """A client that sources the printed env vars actually routes HTTPS through
     the standalone proxy to the upstream origin."""
