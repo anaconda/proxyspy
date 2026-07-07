@@ -1013,6 +1013,7 @@ def test_reverse_loopback_guard(reverse):
 #
 
 
+@pytest.mark.skipif(os.name != "posix", reason="pwd/sudo are POSIX-only")
 def test_default_cert_dir_uses_sudo_user_home(monkeypatch):
     """Under sudo the persistent dir must resolve to the invoking user's home,
     not root's, so the CA lands where the user can trust it."""
@@ -1036,6 +1037,7 @@ def test_sudo_pw_none_without_sudo(monkeypatch):
     assert proxyspy._sudo_pw() is None
 
 
+@pytest.mark.skipif(os.name != "posix", reason="os.chown is POSIX-only")
 def test_chown_to_sudo_user_noop_when_not_sudo(monkeypatch, tmp_path):
     """Without SUDO_USER the chown helper must do nothing (and never touch the
     filesystem), so ordinary non-sudo runs are unaffected."""

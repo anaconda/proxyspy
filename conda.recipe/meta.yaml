@@ -1,5 +1,5 @@
 {% set name = "proxyspy" %}
-{% set version = "0.1.5.post34" %}
+{% set version = "0.1.5.post35" %}
 
 package:
   name: {{ name }}
