@@ -1207,26 +1207,34 @@ def _run_proxyspy_cli(*extra_args):
     return subprocess.run(cmd, capture_output=True, text=True, timeout=10)
 
 
+# On Windows the POSIX-only guard for --manage-hosts/--restore-hosts fires
+# first, so these mode-combination messages are never reached; skip there.
+@pytest.mark.skipif(os.name != "posix", reason="hosts flags are POSIX-only")
 def test_manage_hosts_requires_reverse():
     result = _run_proxyspy_cli("--manage-hosts", "--", "echo", "hi")
     assert result.returncode == 2
     assert "--manage-hosts requires --reverse" in result.stderr
 
 
+@pytest.mark.skipif(os.name != "posix", reason="hosts flags are POSIX-only")
 def test_restore_hosts_rejects_reverse():
     result = _run_proxyspy_cli("--restore-hosts", "--reverse")
     assert result.returncode == 2
     assert "--restore-hosts is standalone" in result.stderr
 
 
+@pytest.mark.skipif(os.name != "posix", reason="hosts flags are POSIX-only")
 def test_restore_hosts_rejects_command():
     result = _run_proxyspy_cli("--restore-hosts", "--", "echo", "hi")
     assert result.returncode == 2
     assert "--restore-hosts is standalone" in result.stderr
 
 
+# The root requirement is only enforced on POSIX (os.geteuid); on Windows the
+# check is skipped entirely, so these tests only make sense there.
 @pytest.mark.skipif(
-    os.name == "posix" and os.geteuid() == 0, reason="already root; the check can't fire"
+    os.name != "posix" or os.geteuid() == 0,
+    reason="root check is POSIX-only and can't fire when already root",
 )
 def test_restore_hosts_requires_root():
     result = _run_proxyspy_cli("--restore-hosts")
@@ -1236,7 +1244,8 @@ def test_restore_hosts_requires_root():
 
 
 @pytest.mark.skipif(
-    os.name == "posix" and os.geteuid() == 0, reason="already root; the check can't fire"
+    os.name != "posix" or os.geteuid() == 0,
+    reason="root check is POSIX-only and can't fire when already root",
 )
 def test_reverse_default_port_requires_root():
     """--reverse with no explicit --port defaults to 443, a privileged port."""
@@ -1247,7 +1256,8 @@ def test_reverse_default_port_requires_root():
 
 
 @pytest.mark.skipif(
-    os.name == "posix" and os.geteuid() == 0, reason="already root; the check can't fire"
+    os.name != "posix" or os.geteuid() == 0,
+    reason="root check is POSIX-only and can't fire when already root",
 )
 def test_reverse_manage_hosts_requires_root_for_both_reasons():
     result = _run_proxyspy_cli("--reverse", "--manage-hosts", "--intercept-host", "example.com")
