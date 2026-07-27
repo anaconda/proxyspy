@@ -1,6 +1,7 @@
 import ipaddress
 import json
 import os
+import shlex
 import shutil
 import socket
 import ssl
@@ -1055,6 +1056,182 @@ def test_chown_to_sudo_user_noop_when_not_sudo(monkeypatch, tmp_path):
 
     proxyspy._chown_to_sudo_user(str(tmp_path))
     assert called == []
+
+
+#
+# Standalone forward mode (--standalone)
+#
+
+
+class StandaloneHarness:
+    """Lifecycle manager for a standalone (--standalone) proxyspy instance.
+
+    Like reverse mode it has no child command and uses a persistent --cert-dir,
+    so this launches proxyspy directly and parses the auto-selected port from
+    the log. The banner is captured from stdout.
+    """
+
+    def __init__(self, tmp_path):
+        self.tmp_path = tmp_path
+        self.cert_dir = tmp_path / "certs"
+        self.log_file = tmp_path / "standalone.log"
+        self.script_path = find_proxyspy()
+        self.process = None
+        self.port = None
+        self.stdout = ""
+
+    def start(self, *extra_args, trust=None):
+        if isinstance(self.script_path, Path) or str(self.script_path).endswith(".py"):
+            cmd = ["python", str(self.script_path)]
+        else:
+            cmd = [str(self.script_path)]
+        cmd += [
+            "--standalone",
+            "--port",
+            "0",
+            "--cert-dir",
+            str(self.cert_dir),
+            "--logfile",
+            str(self.log_file),
+            "--debug",
+        ]
+        cmd += list(extra_args)
+        print(f"\nStarting standalone proxy: {' '.join(cmd)}")
+        env = os.environ.copy()
+        if trust:
+            env["SSL_CERT_FILE"] = str(trust)
+        self.process = Popen(cmd, env=env, stdout=subprocess.PIPE, text=True)
+
+        # The banner is printed after the server starts; parse the log for the
+        # port so we don't block on the pipe.
+        start_time = time.time()
+        while time.time() - start_time < 10:
+            if self.process.poll() is not None:
+                raise RuntimeError("Standalone proxy exited during startup")
+            if self.log_file.exists():
+                for line in self.log_file.read_text().splitlines():
+                    if "Proxy server started on port" in line:
+                        self.port = int(line.split("port")[1].strip())
+                        return
+            time.sleep(0.1)
+        raise RuntimeError("Standalone proxy failed to start within 10 seconds")
+
+    @property
+    def ca_path(self):
+        return str(self.cert_dir / "cert.pem")
+
+    @property
+    def env_file(self):
+        return self.cert_dir / "env"
+
+    def proxy_url(self):
+        return f"http://localhost:{self.port}"
+
+    def logs(self):
+        return self.log_file.read_text() if self.log_file.exists() else ""
+
+    def stop(self):
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                out, _ = self.process.communicate(timeout=5)
+            except Exception:
+                self.process.kill()
+                out, _ = self.process.communicate()
+            self.stdout = out or ""
+
+
+@pytest.fixture
+def standalone(tmp_path):
+    harness = StandaloneHarness(tmp_path)
+    try:
+        yield harness
+    finally:
+        harness.stop()
+
+
+def test_standalone_rejects_reverse():
+    result = _run_proxyspy_cli("--standalone", "--reverse")
+    assert result.returncode == 2
+    assert "mutually exclusive" in result.stderr
+
+
+def test_standalone_rejects_command():
+    result = _run_proxyspy_cli("--standalone", "--", "echo", "hi")
+    assert result.returncode == 2
+    assert "cannot be given in --reverse or --standalone" in result.stderr
+
+
+def test_standalone_writes_env_file_and_banner(standalone):
+    """Standalone mode writes a source-able env file and prints a copy-pasteable
+    banner, then removes the env file on clean shutdown."""
+    standalone.start()
+
+    env_file = standalone.env_file
+    assert env_file.exists(), "env file should exist while running"
+    contents = env_file.read_text()
+    proxy_url = standalone.proxy_url()
+    # Values are shell-quoted (shlex.quote), which matters on Windows where the
+    # cert path contains backslashes and gets wrapped in single quotes.
+    ca = shlex.quote(standalone.ca_path)
+    assert f"export HTTPS_PROXY={shlex.quote(proxy_url)}" in contents
+    assert f"export SSL_CERT_FILE={ca}" in contents
+    assert f"export CONDA_SSL_VERIFY={ca}" in contents
+    # Empty NO_PROXY must be shell-quoted so `source` doesn't choke.
+    assert "export NO_PROXY=''" in contents
+
+    standalone.stop()
+    # On POSIX, stop() sends SIGTERM which proxyspy converts to a clean shutdown
+    # that removes the env file. On Windows, terminate() maps to TerminateProcess
+    # (an uncatchable hard kill), so the file may persist until the next run; we
+    # don't assert removal there.
+    if os.name == "posix":
+        assert not env_file.exists(), "env file should be removed on shutdown"
+
+    # The banner went to stdout with the same values, ready to copy-paste.
+    banner = standalone.stdout
+    assert "ProxySpy standalone (forward proxy) listening" in banner
+    assert f"export HTTPS_PROXY={shlex.quote(proxy_url)}" in banner
+    assert f"source {shlex.quote(str(env_file))}" in banner
+
+
+def test_standalone_banner_survives_unwritable_env_file(standalone):
+    """If the env file cannot be written (e.g. a root-owned ~/.proxyspy from a
+    prior sudo run), the copy-pasteable banner must still print; only the
+    'source ...' line is dropped."""
+    # Pre-create <cert-dir>/env as a directory so open(path, "w") fails with an
+    # OSError, without needing to fiddle with ownership or permissions.
+    standalone.cert_dir.mkdir(parents=True, exist_ok=True)
+    (standalone.cert_dir / "env").mkdir()
+
+    standalone.start()
+    proxy_url = standalone.proxy_url()
+    standalone.stop()
+
+    assert "Cannot write env file" in standalone.logs()
+    banner = standalone.stdout
+    assert "ProxySpy standalone (forward proxy) listening" in banner
+    assert f"export HTTPS_PROXY={shlex.quote(proxy_url)}" in banner
+    # No source-able file, so that line is omitted rather than pointing nowhere.
+    assert "source " not in banner
+
+
+def test_standalone_forwards_request(standalone, origin):
+    """A client that sources the printed env vars actually routes HTTPS through
+    the standalone proxy to the upstream origin."""
+    standalone.start(trust=origin.cert_path)
+
+    session = requests.Session()
+    session.trust_env = False
+    session.proxies = {"http": standalone.proxy_url(), "https": standalone.proxy_url()}
+    session.verify = standalone.ca_path
+    resp = session.get(f"https://{ORIGIN_HOST}:{origin.port}/get", timeout=10)
+
+    assert resp.status_code == 200
+    assert resp.json()["url"] == "/get"
+    logs = standalone.logs()
+    assert f"CONNECT {ORIGIN_HOST}:{origin.port}" in logs
+    assert "[P<>S] SSL handshake completed" in logs
 
 
 #
