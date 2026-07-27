@@ -70,7 +70,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -89,12 +89,6 @@ jobs:
         name: packages
         path: dist
 
-    - name: Add random delay to space out tests
-      run: |
-        DELAY=$(( $RANDOM % 20 ))
-        echo "Waiting $DELAY seconds before starting tests"
-        sleep $DELAY
-
     - name: Test package (conda)
       run: |
         conda_pkg=$(basename dist/conda/noarch/proxyspy-* | \
@@ -103,14 +97,21 @@ jobs:
           python=${{ matrix.python-version }} \
           "$conda_pkg" pytest requests psutil
         conda activate testconda
-        pytest -v tests || pytest -v tests
+        pytest -v tests
+
+    - name: Test /etc/hosts management (root-gated, POSIX only)
+      if: runner.os != 'Windows'
+      run: |
+        conda activate testconda
+        sudo -E env "PATH=$PATH" PROXYSPY_TEST_HOSTS=1 \
+          python -m pytest -v tests -k ManageHostsIntegration
 
     - name: Test package (pip)
       run: |
         wheel_file=$(ls dist/proxyspy-*.whl)
         conda create -n testpip python=${{ matrix.python-version }}
         pip install "${wheel_file}[test]"
-        pytest -v tests || pytest -v tests
+        pytest -v tests
 
     - name: Example output for timing study
       run: |

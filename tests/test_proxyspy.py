@@ -1,20 +1,154 @@
+import ipaddress
+import json
 import os
+import shlex
 import shutil
 import socket
+import ssl
+import subprocess
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from subprocess import Popen
+from threading import Thread
 
 import psutil
 import pytest
 import requests
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 from requests.adapters import HTTPAdapter
 from requests.exceptions import ConnectionError, ProxyError, ReadTimeout, RequestException
 from urllib3.util.retry import MaxRetryError, Retry
 
+import proxyspy
+
 EXCEPTIONS = ConnectionError, ProxyError, ReadTimeout, RequestException, MaxRetryError
+
+# Hostname the forwarding tests use for the in-process origin. It resolves to
+# loopback without DNS and the origin's certificate is valid for it.
+ORIGIN_HOST = "localhost"
+
+
+def _robust_rmtree(path, attempts=5):
+    """shutil.rmtree that tolerates Windows' lag in releasing file/dir handles
+    held by a just-terminated subprocess (WinError 32)."""
+    for attempt in range(attempts):
+        try:
+            shutil.rmtree(path)
+            return
+        except (PermissionError, OSError):
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.5 * (attempt + 1))
+
+
+def _make_origin_cert(cert_dir):
+    """Generate a self-signed cert/key valid for ORIGIN_HOST and 127.0.0.1.
+
+    The cert serves double duty: it is the origin's server certificate and,
+    because it is self-signed, its own CA file. Pointing the proxy's
+    SSL_CERT_FILE at it lets proxyspy verify the origin upstream.
+    """
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, ORIGIN_HOST)])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.now(timezone.utc) - timedelta(minutes=5))
+        .not_valid_after(datetime.now(timezone.utc) + timedelta(days=365))
+        .add_extension(
+            x509.SubjectAlternativeName(
+                [x509.DNSName(ORIGIN_HOST), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]
+            ),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+    cert_path = os.path.join(cert_dir, "origin-cert.pem")
+    key_path = os.path.join(cert_dir, "origin-key.pem")
+    with open(cert_path, "wb") as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+    with open(key_path, "wb") as f:
+        f.write(
+            key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption(),
+            )
+        )
+    return cert_path, key_path
+
+
+class _OriginHandler(BaseHTTPRequestHandler):
+    """Minimal stand-in for the httpbin endpoints the tests exercise:
+    /get (JSON echo), /bytes/<n> (n bytes), and ?ndx=N query echo on /get."""
+
+    def log_message(self, *args):
+        pass  # keep test output quiet
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path == "/get":
+            body = json.dumps({"url": self.path, "headers": dict(self.headers)}).encode()
+            self._respond(200, body, "application/json")
+        elif path.startswith("/bytes/"):
+            try:
+                n = int(path.rsplit("/", 1)[1])
+            except ValueError:
+                self._respond(404, b"bad byte count", "text/plain")
+                return
+            self._respond(200, bytes(n), "application/octet-stream")
+        else:
+            self._respond(404, b"not found", "text/plain")
+
+    def _respond(self, code, body, content_type):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class LocalOrigin:
+    """In-process HTTPS origin so the forwarding tests don't depend on a public
+    server. Cross-platform and available to local `pytest` runs."""
+
+    def __init__(self, cert_dir):
+        self.cert_path, self.key_path = _make_origin_cert(cert_dir)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(self.cert_path, self.key_path)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _OriginHandler)
+        self.server.socket = ctx.wrap_socket(self.server.socket, server_side=True)
+        self.port = self.server.server_address[1]
+        self.thread = Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    @property
+    def base_url(self):
+        return f"https://{ORIGIN_HOST}:{self.port}"
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def origin(tmp_path):
+    """A running in-process HTTPS origin; yields the LocalOrigin instance."""
+    server = LocalOrigin(str(tmp_path))
+    try:
+        yield server
+    finally:
+        server.stop()
 
 
 def find_proxyspy():
@@ -50,8 +184,13 @@ class ProxyTestHarness:
         self.old_env = dict(os.environ)
         self.logs = None
 
-    def start_proxy(self, *extra_args):
-        """Start the proxy with a long-running sleep process."""
+    def start_proxy(self, *extra_args, trust=None):
+        """Start the proxy with a long-running sleep process.
+
+        trust: optional path to a CA/cert file the proxy process should trust
+        for upstream verification (via SSL_CERT_FILE), e.g. a LocalOrigin's
+        certificate so the proxy can forward to the in-process origin.
+        """
         # Find an available port by trying until we succeed
 
         # Default to port 0 (auto-selection) if no port specified
@@ -78,7 +217,12 @@ class ProxyTestHarness:
         # Long-running process to keep proxy alive
         cmd.extend(("--debug", "--", "sleep", "3600"))
         print(f"\nStarting proxy server: {' '.join(cmd)}")
-        self.proxy_process = Popen(cmd)
+        env = os.environ.copy()
+        if trust:
+            # The proxy verifies upstream certs with create_default_context();
+            # SSL_CERT_FILE makes it trust the in-process origin's certificate.
+            env["SSL_CERT_FILE"] = str(trust)
+        self.proxy_process = Popen(cmd, env=env)
         self.proxy_psutil = psutil.Process(self.proxy_process.pid)
 
         # Wait for and parse startup logs
@@ -345,20 +489,20 @@ def test_proxy_intercept(proxy, session):
     proxy.assert_intercepted()
 
 
-def test_forwarding_response_body(proxy, session):
+def test_forwarding_response_body(proxy, session, origin):
     """Test that forwarded responses handle response bodies correctly."""
-    proxy.start_proxy()
+    proxy.start_proxy(trust=origin.cert_path)
 
     # Try bytes endpoint first with small payload
     print("\nTesting small binary response")
-    response = session.get("https://httpbingo.org/bytes/64")
+    response = session.get(f"{origin.base_url}/bytes/64")
     assert response.status_code == 200
     assert len(response.content) == 64
     print("Successfully received 64 bytes")
 
     # Now try the larger response
     print("\nTesting 1KB binary response")
-    response = session.get("https://httpbingo.org/bytes/1024")
+    response = session.get(f"{origin.base_url}/bytes/1024")
     assert response.status_code == 200
     print(f"Received {len(response.content)} bytes")
     assert len(response.content) == 1024
@@ -474,8 +618,13 @@ def test_intercept_headers(proxy, session):
     proxy.assert_intercepted()
 
 
-def test_intercept_hosts(proxy, session):
-    """Test that the proxy only intercepts requests matching the specified patterns."""
+def test_intercept_hosts(proxy, session, origin):
+    """Test that the proxy only intercepts requests matching the specified patterns.
+
+    The intercepted hosts (example.com/.org) are never contacted upstream, so
+    they need not be real; only the single non-intercepted control is forwarded
+    to the in-process origin, so the test has no public-network dependency.
+    """
     proxy.start_proxy(
         "--return-code",
         "418",
@@ -484,39 +633,28 @@ def test_intercept_hosts(proxy, session):
         "--return-data",
         '{"status": "intercepted by host list"}',
         "--intercept-host",
-        "httpbingo.org",
-        "--intercept-host",
         "example.com",
+        "--intercept-host",
+        "example.org",
+        trust=origin.cert_path,
     )
 
-    # Request 1: Should match first pattern
-    resp_match1 = session.get("https://httpbingo.org/get")
-    assert resp_match1.status_code == 418
-    proxy.verify_header(resp_match1, "X-Test", "Host Match")
-    assert resp_match1.json() == {"status": "intercepted by host list"}
+    # Requests 1 & 2: hosts in the intercept list -> canned response, no upstream
+    for host in ("example.com", "example.org"):
+        resp_match = session.get(f"https://{host}/")
+        assert resp_match.status_code == 418
+        proxy.verify_header(resp_match, "X-Test", "Host Match")
+        assert resp_match.json() == {"status": "intercepted by host list"}
+        proxy.get_logs(force=True)
+        assert any(f"{host} found in intercept list" in line for line in proxy.get_logs())
 
-    # Force refresh logs and verify first request
-    proxy.get_logs(force=True)
-    assert any("httpbingo.org found in intercept list" in line for line in proxy.get_logs())
-
-    # Request 2: Should match second pattern
-    resp_match2 = session.get("https://example.com/")
-    assert resp_match2.status_code == 418
-    proxy.verify_header(resp_match2, "X-Test", "Host Match")
-    assert resp_match2.json() == {"status": "intercepted by host list"}
-
-    # Force refresh logs and verify second request
-    proxy.get_logs(force=True)
-    assert any("example.com found in intercept list" in line for line in proxy.get_logs())
-
-    # Request 3: Should not match any pattern
-    resp_nomatch = session.get("https://example.org/")
+    # Request 3: host not in the intercept list -> forwarded to the origin
+    resp_nomatch = session.get(f"{origin.base_url}/get")
     assert resp_nomatch.status_code == 200
-    assert "Example Domain" in resp_nomatch.text
 
-    # Force refresh logs and verify third request
+    # Force refresh logs and verify the forwarded request
     logs = proxy.get_logs(force=True)
-    assert any("example.org not found in intercept list" in line for line in logs)
+    assert any(f"{ORIGIN_HOST} not found in intercept list" in line for line in logs)
 
     # Check connections to verify SSL handshakes
     connections = proxy.get_connections()
@@ -529,20 +667,20 @@ def test_intercept_hosts(proxy, session):
         return None
 
     # Verify both matching connections were intercepted (client SSL but no server SSL)
-    for domain in ["httpbingo.org", "example.com"]:
+    for domain in ["example.com", "example.org"]:
         conn_lines = find_connection(domain)
         assert conn_lines is not None, f"Connection for {domain} not found"
         assert any("[C<>P] SSL handshake completed" in line for line in conn_lines)
         assert not any("[P<>S] SSL handshake completed" in line for line in conn_lines)
 
     # Verify non-matching connection was forwarded (both client and server SSL)
-    nonmatch_lines = find_connection("example.org")
-    assert nonmatch_lines is not None, "Connection for example.org not found"
+    nonmatch_lines = find_connection(ORIGIN_HOST)
+    assert nonmatch_lines is not None, f"Connection for {ORIGIN_HOST} not found"
     assert any("[C<>P] SSL handshake completed" in line for line in nonmatch_lines)
     assert any("[P<>S] SSL handshake completed" in line for line in nonmatch_lines)
 
 
-def test_keep_certs(proxy, session):
+def test_keep_certs(proxy, session, origin):
     """Test that --keep-certs option keeps certificates in current directory."""
     # Start in a clean temp directory
     orig_dir = os.getcwd()
@@ -552,7 +690,7 @@ def test_keep_certs(proxy, session):
 
     try:
         # Start proxy with --keep-certs
-        proxy.start_proxy("--keep-certs")
+        proxy.start_proxy("--keep-certs", trust=origin.cert_path)
 
         # Verify CA cert files exist in current directory
         ca_cert = Path("cert.pem")
@@ -560,11 +698,11 @@ def test_keep_certs(proxy, session):
         assert ca_cert.exists(), "CA certificate not found"
         assert ca_key.exists(), "CA key not found"
 
-        session.get("https://httpbingo.org/get")
+        session.get(f"{origin.base_url}/get")
 
         # Verify host cert files exist
-        host_cert = Path("httpbingo.org-cert.pem")
-        host_key = Path("httpbingo.org-key.pem")
+        host_cert = Path(f"{ORIGIN_HOST}-cert.pem")
+        host_key = Path(f"{ORIGIN_HOST}-key.pem")
         assert host_cert.exists(), "Host certificate not found"
         assert host_key.exists(), "Host key not found"
 
@@ -576,9 +714,13 @@ def test_keep_certs(proxy, session):
         assert host_key.exists(), "Host key removed"
 
     finally:
-        # Clean up and restore directory
+        # Clean up and restore directory. On Windows the proxy subprocess runs
+        # with its cwd inside temp_dir and locks it, so make sure it is stopped
+        # (releasing the directory handle) before removing the tree, and retry
+        # rmtree to absorb the lag in Windows releasing the handle.
         os.chdir(orig_dir)
-        shutil.rmtree(temp_dir)
+        proxy.stop_proxy()
+        _robust_rmtree(temp_dir)
 
 
 def test_proxy_delay(proxy, session):
@@ -617,13 +759,13 @@ def test_proxy_delay(proxy, session):
             pytest.fail("No 'End of delay' message found in logs")
 
 
-def test_concurrent_connections(proxy):
+def test_concurrent_connections(proxy, origin):
     """Test that the proxy can handle multiple simultaneous connections."""
-    proxy.start_proxy()
+    proxy.start_proxy(trust=origin.cert_path)
 
     def make_request(i):
         # Create session with retry strategy
-        url = f"https://httpbingo.org/get?ndx={i}"
+        url = f"{origin.base_url}/get?ndx={i}"
         try:
             resp = _get_session().get(url, timeout=5.0)
             return resp.status_code, i
@@ -690,3 +832,687 @@ def test_sequential_proxy_starts(tmp_path):
     # Verify we got different ports
     print(f"Ports used: {ports_used}")
     assert len(set(ports_used)) > 1, "Auto-port selection didn't rotate ports"
+
+
+#
+# Reverse / transparent mode
+#
+
+
+class ReverseHarness:
+    """Lifecycle manager for a standalone (--reverse) proxyspy instance.
+
+    Unlike ProxyTestHarness, reverse mode has no child command and uses a
+    persistent --cert-dir, so this launches proxyspy directly and parses the
+    auto-selected listen port from the log.
+    """
+
+    def __init__(self, tmp_path):
+        self.tmp_path = tmp_path
+        self.cert_dir = tmp_path / "certs"
+        self.log_file = tmp_path / "reverse.log"
+        self.script_path = find_proxyspy()
+        self.process = None
+        self.port = None
+
+    def start(self, *extra_args, expect_exit=False, trust=None):
+        if isinstance(self.script_path, Path) or str(self.script_path).endswith(".py"):
+            cmd = ["python", str(self.script_path)]
+        else:
+            cmd = [str(self.script_path)]
+        cmd += [
+            "--reverse",
+            "--port",
+            "0",
+            "--cert-dir",
+            str(self.cert_dir),
+            "--logfile",
+            str(self.log_file),
+            "--debug",
+        ]
+        cmd += list(extra_args)
+        print(f"\nStarting reverse proxy: {' '.join(cmd)}")
+        # proxyspy opens the logfile in append mode, so a second start() on the
+        # same tmp_path would see the previous run's "listening" line and return
+        # early (before this run self-heals/logs). Truncate so we only ever match
+        # this invocation's output.
+        if self.log_file.exists():
+            self.log_file.unlink()
+        env = os.environ.copy()
+        if trust:
+            # Trust the in-process origin's cert for upstream verification.
+            env["SSL_CERT_FILE"] = str(trust)
+        self.process = Popen(cmd, env=env)
+
+        # When we expect a clean startup, wait for the listening line and port.
+        if expect_exit:
+            self.process.wait(timeout=10)
+            return
+        start_time = time.time()
+        while time.time() - start_time < 10:
+            if self.process.poll() is not None:
+                raise RuntimeError("Reverse proxy exited during startup")
+            if self.log_file.exists():
+                for line in self.log_file.read_text().splitlines():
+                    if "Reverse proxy listening on 127.0.0.1:" in line:
+                        self.port = int(line.rsplit(":", 1)[1])
+                        return
+            time.sleep(0.1)
+        raise RuntimeError("Reverse proxy failed to start within 10 seconds")
+
+    @property
+    def ca_path(self):
+        return str(self.cert_dir / "cert.pem")
+
+    def connect(self, host, verify=True):
+        """Open a TLS connection to the proxy with the given SNI host."""
+        if verify:
+            ctx = ssl.create_default_context(cafile=self.ca_path)
+        else:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        raw = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+        return ctx.wrap_socket(raw, server_hostname=host)
+
+    def logs(self):
+        return self.log_file.read_text() if self.log_file.exists() else ""
+
+    def stop(self):
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except Exception:
+                self.process.kill()
+                self.process.wait()
+
+
+@pytest.fixture
+def reverse(tmp_path):
+    harness = ReverseHarness(tmp_path)
+    try:
+        yield harness
+    finally:
+        harness.stop()
+
+
+def test_reverse_intercept(reverse):
+    """Reverse mode returns canned responses, selecting the cert via SNI,
+    without ever contacting a real upstream."""
+    reverse.start(
+        "--intercept-host",
+        "example.com",
+        "--return-code",
+        "418",
+        "--return-header",
+        "X-Test: reverse",
+        "--return-data",
+        "teapot",
+    )
+
+    sock = reverse.connect("example.com")
+    sock.sendall(b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+    response = b""
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        response += chunk
+    sock.close()
+
+    text = response.decode("iso-8859-1")
+    assert "418 Intercepted" in text
+    assert "X-Test: reverse" in text
+    assert text.endswith("teapot")
+
+    logs = reverse.logs()
+    # Cert chosen via SNI, request intercepted, no upstream handshake.
+    assert "SSL handshake completed (SNI: example.com)" in logs
+    assert "example.com found in intercept list" in logs
+    assert "[P<>S] SSL handshake completed" not in logs
+
+
+def test_reverse_forward(reverse, origin):
+    """Reverse mode forwards to the upstream, MITMing both ends. The upstream
+    is pinned to the in-process origin with --map, which also exercises the
+    upstream-override path and avoids any public-network dependency."""
+    reverse.start(
+        "--prepare-host",
+        ORIGIN_HOST,
+        "--map",
+        f"{ORIGIN_HOST}=127.0.0.1",
+        "--upstream-port",
+        str(origin.port),
+        trust=origin.cert_path,
+    )
+
+    logs = reverse.logs()
+    assert f"Upstream for {ORIGIN_HOST} ->" in logs, "Upstream was not configured at startup"
+
+    sock = reverse.connect(ORIGIN_HOST)
+    sock.sendall(f"GET /get HTTP/1.1\r\nHost: {ORIGIN_HOST}\r\nConnection: close\r\n\r\n".encode())
+    response = b""
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        response += chunk
+    sock.close()
+
+    status_line = response.split(b"\r\n", 1)[0]
+    assert status_line.startswith(b"HTTP/") and b" 200" in status_line, status_line
+    logs = reverse.logs()
+    assert f"SSL handshake completed (SNI: {ORIGIN_HOST})" in logs
+    assert "[P<>S] SSL handshake completed" in logs
+
+
+def test_reverse_loopback_guard(reverse):
+    """A host already resolving to loopback must abort startup with a clear
+    error rather than forwarding into the proxy itself."""
+    reverse.start("--prepare-host", "localhost", expect_exit=True)
+
+    assert reverse.process.returncode == 1
+    assert "loopback address" in reverse.logs()
+
+
+#
+# Persistent cert-dir ownership under sudo
+#
+
+
+@pytest.mark.skipif(os.name != "posix", reason="pwd/sudo are POSIX-only")
+def test_default_cert_dir_uses_sudo_user_home(monkeypatch):
+    """Under sudo the persistent dir must resolve to the invoking user's home,
+    not root's, so the CA lands where the user can trust it."""
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setenv("SUDO_USER", "someuser")
+
+    class _PW:
+        pw_dir = "/home/someuser"
+        pw_uid = 1000
+        pw_gid = 1000
+        pw_name = "someuser"
+
+    import pwd
+
+    monkeypatch.setattr(pwd, "getpwnam", lambda name: _PW if name == "someuser" else 1 / 0)
+    assert proxyspy.default_cert_dir() == os.path.join("/home/someuser", ".proxyspy")
+
+
+def test_sudo_pw_none_without_sudo(monkeypatch):
+    monkeypatch.delenv("SUDO_USER", raising=False)
+    assert proxyspy._sudo_pw() is None
+
+
+@pytest.mark.skipif(os.name != "posix", reason="os.chown is POSIX-only")
+def test_chown_to_sudo_user_noop_when_not_sudo(monkeypatch, tmp_path):
+    """Without SUDO_USER the chown helper must do nothing (and never touch the
+    filesystem), so ordinary non-sudo runs are unaffected."""
+    monkeypatch.delenv("SUDO_USER", raising=False)
+    called = []
+    monkeypatch.setattr(os, "chown", lambda *a, **k: called.append(a))
+    (tmp_path / "cert.pem").write_text("x")
+
+    proxyspy._chown_to_sudo_user(str(tmp_path))
+    assert called == []
+
+
+#
+# Standalone forward mode (--standalone)
+#
+
+
+class StandaloneHarness:
+    """Lifecycle manager for a standalone (--standalone) proxyspy instance.
+
+    Like reverse mode it has no child command and uses a persistent --cert-dir,
+    so this launches proxyspy directly and parses the auto-selected port from
+    the log. The banner is captured from stdout.
+    """
+
+    def __init__(self, tmp_path):
+        self.tmp_path = tmp_path
+        self.cert_dir = tmp_path / "certs"
+        self.log_file = tmp_path / "standalone.log"
+        self.script_path = find_proxyspy()
+        self.process = None
+        self.port = None
+        self.stdout = ""
+
+    def start(self, *extra_args, trust=None):
+        if isinstance(self.script_path, Path) or str(self.script_path).endswith(".py"):
+            cmd = ["python", str(self.script_path)]
+        else:
+            cmd = [str(self.script_path)]
+        cmd += [
+            "--standalone",
+            "--port",
+            "0",
+            "--cert-dir",
+            str(self.cert_dir),
+            "--logfile",
+            str(self.log_file),
+            "--debug",
+        ]
+        cmd += list(extra_args)
+        print(f"\nStarting standalone proxy: {' '.join(cmd)}")
+        env = os.environ.copy()
+        if trust:
+            env["SSL_CERT_FILE"] = str(trust)
+        self.process = Popen(cmd, env=env, stdout=subprocess.PIPE, text=True)
+
+        # The banner is printed after the server starts; parse the log for the
+        # port so we don't block on the pipe.
+        start_time = time.time()
+        while time.time() - start_time < 10:
+            if self.process.poll() is not None:
+                raise RuntimeError("Standalone proxy exited during startup")
+            if self.log_file.exists():
+                for line in self.log_file.read_text().splitlines():
+                    if "Proxy server started on port" in line:
+                        self.port = int(line.split("port")[1].strip())
+                        return
+            time.sleep(0.1)
+        raise RuntimeError("Standalone proxy failed to start within 10 seconds")
+
+    @property
+    def ca_path(self):
+        return str(self.cert_dir / "cert.pem")
+
+    @property
+    def env_file(self):
+        return self.cert_dir / "env"
+
+    def proxy_url(self):
+        return f"http://localhost:{self.port}"
+
+    def logs(self):
+        return self.log_file.read_text() if self.log_file.exists() else ""
+
+    def stop(self):
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                out, _ = self.process.communicate(timeout=5)
+            except Exception:
+                self.process.kill()
+                out, _ = self.process.communicate()
+            self.stdout = out or ""
+
+
+@pytest.fixture
+def standalone(tmp_path):
+    harness = StandaloneHarness(tmp_path)
+    try:
+        yield harness
+    finally:
+        harness.stop()
+
+
+def test_standalone_rejects_reverse():
+    result = _run_proxyspy_cli("--standalone", "--reverse")
+    assert result.returncode == 2
+    assert "mutually exclusive" in result.stderr
+
+
+def test_standalone_rejects_command():
+    result = _run_proxyspy_cli("--standalone", "--", "echo", "hi")
+    assert result.returncode == 2
+    assert "cannot be given in --reverse or --standalone" in result.stderr
+
+
+def test_standalone_writes_env_file_and_banner(standalone):
+    """Standalone mode writes a source-able env file and prints a copy-pasteable
+    banner, then removes the env file on clean shutdown."""
+    standalone.start()
+
+    env_file = standalone.env_file
+    assert env_file.exists(), "env file should exist while running"
+    contents = env_file.read_text()
+    proxy_url = standalone.proxy_url()
+    # Values are shell-quoted (shlex.quote), which matters on Windows where the
+    # cert path contains backslashes and gets wrapped in single quotes.
+    ca = shlex.quote(standalone.ca_path)
+    assert f"export HTTPS_PROXY={shlex.quote(proxy_url)}" in contents
+    assert f"export SSL_CERT_FILE={ca}" in contents
+    assert f"export CONDA_SSL_VERIFY={ca}" in contents
+    # Empty NO_PROXY must be shell-quoted so `source` doesn't choke.
+    assert "export NO_PROXY=''" in contents
+
+    standalone.stop()
+    # On POSIX, stop() sends SIGTERM which proxyspy converts to a clean shutdown
+    # that removes the env file. On Windows, terminate() maps to TerminateProcess
+    # (an uncatchable hard kill), so the file may persist until the next run; we
+    # don't assert removal there.
+    if os.name == "posix":
+        assert not env_file.exists(), "env file should be removed on shutdown"
+
+    # The banner went to stdout with the same values, ready to copy-paste.
+    banner = standalone.stdout
+    assert "ProxySpy standalone (forward proxy) listening" in banner
+    assert f"export HTTPS_PROXY={shlex.quote(proxy_url)}" in banner
+    assert f"source {shlex.quote(str(env_file))}" in banner
+
+
+def test_standalone_banner_survives_unwritable_env_file(standalone):
+    """If the env file cannot be written (e.g. a root-owned ~/.proxyspy from a
+    prior sudo run), the copy-pasteable banner must still print; only the
+    'source ...' line is dropped."""
+    # Pre-create <cert-dir>/env as a directory so open(path, "w") fails with an
+    # OSError, without needing to fiddle with ownership or permissions.
+    standalone.cert_dir.mkdir(parents=True, exist_ok=True)
+    (standalone.cert_dir / "env").mkdir()
+
+    standalone.start()
+    proxy_url = standalone.proxy_url()
+    standalone.stop()
+
+    assert "Cannot write env file" in standalone.logs()
+    banner = standalone.stdout
+    assert "ProxySpy standalone (forward proxy) listening" in banner
+    assert f"export HTTPS_PROXY={shlex.quote(proxy_url)}" in banner
+    # No source-able file, so that line is omitted rather than pointing nowhere.
+    assert "source " not in banner
+
+
+def test_standalone_forwards_request(standalone, origin):
+    """A client that sources the printed env vars actually routes HTTPS through
+    the standalone proxy to the upstream origin."""
+    standalone.start(trust=origin.cert_path)
+
+    session = requests.Session()
+    session.trust_env = False
+    session.proxies = {"http": standalone.proxy_url(), "https": standalone.proxy_url()}
+    session.verify = standalone.ca_path
+    resp = session.get(f"https://{ORIGIN_HOST}:{origin.port}/get", timeout=10)
+
+    assert resp.status_code == 200
+    assert resp.json()["url"] == "/get"
+    logs = standalone.logs()
+    assert f"CONNECT {ORIGIN_HOST}:{origin.port}" in logs
+    assert "[P<>S] SSL handshake completed" in logs
+
+
+#
+# /etc/hosts management (--manage-hosts / --restore-hosts)
+#
+
+
+def test_strip_managed_block_absent():
+    text = "127.0.0.1 localhost\n::1 localhost\n"
+    assert proxyspy._strip_managed_block(text) == text
+
+
+def test_strip_managed_block_present():
+    text = (
+        "127.0.0.1 localhost\n"
+        "# >>> proxyspy >>>\n"
+        "# Managed by proxyspy (PID 123). Do not edit by hand.\n"
+        "127.0.0.1 example.com\n"
+        "# <<< proxyspy <<<\n"
+        "::1 localhost\n"
+    )
+    assert proxyspy._strip_managed_block(text) == "127.0.0.1 localhost\n::1 localhost\n"
+
+
+def test_strip_managed_block_at_start():
+    text = "# >>> proxyspy >>>\n127.0.0.1 example.com\n# <<< proxyspy <<<\n::1 localhost\n"
+    assert proxyspy._strip_managed_block(text) == "::1 localhost\n"
+
+
+def test_strip_managed_block_at_end():
+    text = "127.0.0.1 localhost\n# >>> proxyspy >>>\n127.0.0.1 example.com\n# <<< proxyspy <<<\n"
+    assert proxyspy._strip_managed_block(text) == "127.0.0.1 localhost\n"
+
+
+def test_strip_managed_block_no_trailing_newline():
+    text = "127.0.0.1 localhost\n# >>> proxyspy >>>\n127.0.0.1 example.com\n# <<< proxyspy <<<"
+    assert proxyspy._strip_managed_block(text) == "127.0.0.1 localhost\n"
+
+
+def test_strip_managed_block_two_blocks():
+    text = (
+        "# >>> proxyspy >>>\n127.0.0.1 a.com\n# <<< proxyspy <<<\n"
+        "127.0.0.1 localhost\n"
+        "# >>> proxyspy >>>\n127.0.0.1 b.com\n# <<< proxyspy <<<\n"
+    )
+    assert proxyspy._strip_managed_block(text) == "127.0.0.1 localhost\n"
+
+
+def test_strip_managed_block_unterminated_begin():
+    """A hand-corrupted file with a begin marker but no matching end marker
+    is left untouched rather than swallowing the rest of the file."""
+    text = "127.0.0.1 localhost\n# >>> proxyspy >>>\n127.0.0.1 example.com\n"
+    assert proxyspy._strip_managed_block(text) == text
+
+
+def test_write_managed_hosts_appends_block(tmp_path):
+    hosts_path = tmp_path / "hosts"
+    bak_path = tmp_path / "hosts.bak"
+    hosts_path.write_text("127.0.0.1 localhost\n")
+
+    proxyspy.write_managed_hosts(
+        ["example.com", "example.org"], hosts_path=str(hosts_path), bak_path=str(bak_path)
+    )
+
+    text = hosts_path.read_text()
+    assert text.startswith("127.0.0.1 localhost\n")
+    assert "# >>> proxyspy >>>" in text
+    assert "# <<< proxyspy <<<" in text
+    assert "127.0.0.1 example.com" in text
+    assert "127.0.0.1 example.org" in text
+    # Hosts are sorted within the block
+    assert text.index("example.com") < text.index("example.org")
+
+
+def test_write_managed_hosts_idempotent_across_restarts(tmp_path):
+    hosts_path = tmp_path / "hosts"
+    bak_path = tmp_path / "hosts.bak"
+    hosts_path.write_text("127.0.0.1 localhost\n")
+
+    proxyspy.write_managed_hosts(
+        ["example.com"], hosts_path=str(hosts_path), bak_path=str(bak_path)
+    )
+    proxyspy.write_managed_hosts(
+        ["example.org"], hosts_path=str(hosts_path), bak_path=str(bak_path)
+    )
+
+    text = hosts_path.read_text()
+    assert text.count("# >>> proxyspy >>>") == 1
+    assert "example.com" not in text
+    assert "127.0.0.1 example.org" in text
+    assert text.startswith("127.0.0.1 localhost\n")
+
+
+def test_write_managed_hosts_backs_up_once(tmp_path):
+    hosts_path = tmp_path / "hosts"
+    bak_path = tmp_path / "hosts.bak"
+    original = "127.0.0.1 localhost\n"
+    hosts_path.write_text(original)
+
+    proxyspy.write_managed_hosts(
+        ["example.com"], hosts_path=str(hosts_path), bak_path=str(bak_path)
+    )
+    assert bak_path.read_text() == original
+
+    proxyspy.write_managed_hosts(
+        ["example.org"], hosts_path=str(hosts_path), bak_path=str(bak_path)
+    )
+    assert bak_path.read_text() == original
+
+
+def test_remove_managed_hosts_restores_original(tmp_path):
+    hosts_path = tmp_path / "hosts"
+    bak_path = tmp_path / "hosts.bak"
+    original = "127.0.0.1 localhost\n::1 localhost\n"
+    hosts_path.write_text(original)
+
+    proxyspy.write_managed_hosts(
+        ["example.com"], hosts_path=str(hosts_path), bak_path=str(bak_path)
+    )
+    assert proxyspy.remove_managed_hosts(hosts_path=str(hosts_path)) is True
+    assert hosts_path.read_text() == original
+
+
+def test_remove_managed_hosts_noop_when_absent(tmp_path):
+    hosts_path = tmp_path / "hosts"
+    original = "127.0.0.1 localhost\n"
+    hosts_path.write_text(original)
+
+    assert proxyspy.remove_managed_hosts(hosts_path=str(hosts_path)) is False
+    assert hosts_path.read_text() == original
+
+
+@pytest.mark.skipif(os.name != "posix", reason="permission bits are POSIX-only")
+def test_atomic_write_preserves_permissions(tmp_path):
+    hosts_path = tmp_path / "hosts"
+    bak_path = tmp_path / "hosts.bak"
+    hosts_path.write_text("127.0.0.1 localhost\n")
+    os.chmod(hosts_path, 0o644)
+
+    proxyspy.write_managed_hosts(
+        ["example.com"], hosts_path=str(hosts_path), bak_path=str(bak_path)
+    )
+
+    assert (os.stat(hosts_path).st_mode & 0o777) == 0o644
+
+
+def _run_proxyspy_cli(*extra_args):
+    """Invoke proxyspy directly (no proxy startup) to check argparse validation."""
+    cmd = ["python", find_proxyspy()] + list(extra_args)
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+
+
+# On Windows the POSIX-only guard for --manage-hosts/--restore-hosts fires
+# first, so these mode-combination messages are never reached; skip there.
+@pytest.mark.skipif(os.name != "posix", reason="hosts flags are POSIX-only")
+def test_manage_hosts_requires_reverse():
+    result = _run_proxyspy_cli("--manage-hosts", "--", "echo", "hi")
+    assert result.returncode == 2
+    assert "--manage-hosts requires --reverse" in result.stderr
+
+
+@pytest.mark.skipif(os.name != "posix", reason="hosts flags are POSIX-only")
+def test_restore_hosts_rejects_reverse():
+    result = _run_proxyspy_cli("--restore-hosts", "--reverse")
+    assert result.returncode == 2
+    assert "--restore-hosts is standalone" in result.stderr
+
+
+@pytest.mark.skipif(os.name != "posix", reason="hosts flags are POSIX-only")
+def test_restore_hosts_rejects_command():
+    result = _run_proxyspy_cli("--restore-hosts", "--", "echo", "hi")
+    assert result.returncode == 2
+    assert "--restore-hosts is standalone" in result.stderr
+
+
+# The root requirement is only enforced on POSIX (os.geteuid); on Windows the
+# check is skipped entirely, so these tests only make sense there.
+@pytest.mark.skipif(
+    os.name != "posix" or os.geteuid() == 0,
+    reason="root check is POSIX-only and can't fire when already root",
+)
+def test_restore_hosts_requires_root():
+    result = _run_proxyspy_cli("--restore-hosts")
+    assert result.returncode == 2
+    assert "requires root" in result.stderr
+    assert "modifying /etc/hosts" in result.stderr
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or os.geteuid() == 0,
+    reason="root check is POSIX-only and can't fire when already root",
+)
+def test_reverse_default_port_requires_root():
+    """--reverse with no explicit --port defaults to 443, a privileged port."""
+    result = _run_proxyspy_cli("--reverse", "--prepare-host", "example.com")
+    assert result.returncode == 2
+    assert "requires root" in result.stderr
+    assert "binding privileged port 443" in result.stderr
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or os.geteuid() == 0,
+    reason="root check is POSIX-only and can't fire when already root",
+)
+def test_reverse_manage_hosts_requires_root_for_both_reasons():
+    result = _run_proxyspy_cli("--reverse", "--manage-hosts", "--intercept-host", "example.com")
+    assert result.returncode == 2
+    assert "modifying /etc/hosts" in result.stderr
+    assert "binding privileged port 443" in result.stderr
+
+
+def _hosts_integration_skip_reason():
+    if os.name != "posix":
+        return "requires POSIX"
+    if os.geteuid() != 0:
+        return "requires root"
+    if os.environ.get("PROXYSPY_TEST_HOSTS") != "1":
+        return "set PROXYSPY_TEST_HOSTS=1 to run (mutates real /etc/hosts)"
+    return None
+
+
+@pytest.mark.skipif(
+    _hosts_integration_skip_reason() is not None, reason=_hosts_integration_skip_reason() or ""
+)
+class TestManageHostsIntegration:
+    """Root-gated, opt-in tests that mutate the real /etc/hosts. Runs in CI
+    on non-Windows runners via a dedicated sudo step; run locally with:
+    sudo PROXYSPY_TEST_HOSTS=1 pytest -v tests -k ManageHostsIntegration
+    """
+
+    HOST = "proxyspy-test-host.invalid"
+
+    def test_lifecycle(self, tmp_path):
+        original = Path(proxyspy.HOSTS_PATH).read_text()
+        harness = ReverseHarness(tmp_path)
+        try:
+            harness.start(
+                "--manage-hosts",
+                "--intercept-host",
+                self.HOST,
+                "--return-code",
+                "418",
+            )
+            hosts_text = Path(proxyspy.HOSTS_PATH).read_text()
+            assert "# >>> proxyspy >>>" in hosts_text
+            assert f"127.0.0.1 {self.HOST}" in hosts_text
+
+            sock = harness.connect(self.HOST)
+            sock.sendall(
+                f"GET / HTTP/1.1\r\nHost: {self.HOST}\r\nConnection: close\r\n\r\n".encode()
+            )
+            response = sock.recv(4096)
+            sock.close()
+            assert b"418" in response
+        finally:
+            harness.stop()
+
+        assert Path(proxyspy.HOSTS_PATH).read_text() == original
+
+    def test_self_heal_after_sigkill(self, tmp_path):
+        # --return-code makes HOST intercept-only, so proxyspy never tries to
+        # resolve the unresolvable .invalid upstream at startup.
+        original = Path(proxyspy.HOSTS_PATH).read_text()
+        harness = ReverseHarness(tmp_path)
+        try:
+            harness.start("--manage-hosts", "--intercept-host", self.HOST, "--return-code", "418")
+            assert "# >>> proxyspy >>>" in Path(proxyspy.HOSTS_PATH).read_text()
+
+            harness.process.kill()
+            harness.process.wait(timeout=5)
+            assert "# >>> proxyspy >>>" in Path(proxyspy.HOSTS_PATH).read_text()
+
+            harness2 = ReverseHarness(tmp_path)
+            try:
+                harness2.start(
+                    "--manage-hosts", "--intercept-host", self.HOST, "--return-code", "418"
+                )
+                assert "Self-heal: removed a stale /etc/hosts block" in harness2.logs()
+            finally:
+                harness2.stop()
+        finally:
+            harness.stop()
+
+        assert Path(proxyspy.HOSTS_PATH).read_text() == original

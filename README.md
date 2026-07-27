@@ -81,6 +81,14 @@ The tool starts a proxy server and then runs the specified command with appropri
 - `--return-header H`: Add header H to responses (can repeat)
 - `--return-data DATA`: Return DATA as response body
 - `--intercept-host HOST`: Only intercept requests to HOST (can repeat)
+- `--prepare-host HOST`: Pre-generate the certificate for HOST to avoid first-connection delay (can repeat)
+- `--standalone`: Run the forward proxy standalone: instead of running a command, print the proxy/CA environment variables to set in another terminal (and write them to `<cert-dir>/env` for sourcing), then block until interrupted (see below)
+- `--reverse`: Run as a standalone reverse/transparent proxy instead of running a command (see below)
+- `--manage-hosts`: Automatically add/remove the `/etc/hosts` redirects for declared hosts for the run's lifetime (reverse mode only; POSIX only; see below)
+- `--restore-hosts`: Remove any proxyspy-managed block from `/etc/hosts` and exit (standalone; POSIX only)
+- `--cert-dir DIR`: Directory for the persistent CA and host certificates (reverse and standalone mode default: `~/.proxyspy`)
+- `--map HOST=IP`: Pin the real upstream IP for HOST, bypassing DNS (reverse mode; can repeat)
+- `--upstream-port PORT`: Port to dial on the real upstream servers in reverse mode (default: 443)
 
 ### Examples
 
@@ -120,6 +128,12 @@ proxyspy --return-code 404 \
          -- python conda_script.py
 ```
 
+Run the proxy standalone and drive it from a second terminal:
+
+```bash
+proxyspy --standalone -l spy.log
+```
+
 ## How It Works
 
 The proxy operates in two modes and can optionally add delays to any connection:
@@ -128,6 +142,7 @@ The proxy operates in two modes and can optionally add delays to any connection:
 - Creates a CA certificate and per-host certificates
 - Establishes SSL tunnels to requested hosts
 - Logs all traffic passing through
+- Runs a command as a subprocess, or blocks standalone with `--standalone` (see [Standalone Forward Mode](#standalone-forward-mode))
 
 ### Interception Mode
 - Activated by specifying any of: --return-code, --return-data, --return-header
@@ -143,6 +158,86 @@ The proxy operates in two modes and can optionally add delays to any connection:
 - By default, the proxy automatically selects an available port
 - This prevents socket reuse issues and allows running multiple instances
 - A specific port can be chosen with the --port option
+
+## Standalone Forward Mode
+
+`--standalone` runs the ordinary forward proxy, but instead of launching a command as a subprocess it prints the environment variables a client needs, writes them to a source-able file, and blocks until you press Ctrl-C. Use it when the client you want to watch cannot run as a proxyspy subprocess — for example a long-lived service, an IDE, or a shell session you drive by hand.
+
+On startup it prints a copy-pasteable banner to stdout (always, even with `-l`/`--logfile`), and writes the same `export` lines to `<cert-dir>/env` (default `~/.proxyspy/env`):
+
+```
+========================================================================
+ProxySpy standalone (forward proxy) listening on http://localhost:54321
+
+Paste into another terminal to route HTTPS through ProxySpy:
+
+    export HTTP_PROXY=http://localhost:54321
+    export HTTPS_PROXY=http://localhost:54321
+    ...
+    export SSL_CERT_FILE=/Users/you/.proxyspy/cert.pem
+    export CONDA_SSL_VERIFY=/Users/you/.proxyspy/cert.pem
+
+...or just:  source /Users/you/.proxyspy/env
+
+Press Ctrl-C to stop.
+========================================================================
+```
+
+Workflow:
+
+* In terminal 1, start the proxy: `proxyspy --standalone -l spy.log`.
+* In terminal 2, either paste the printed `export` lines or run `source ~/.proxyspy/env`, then run your client. Its HTTPS traffic is now proxied and logged to `spy.log`.
+* Press Ctrl-C in terminal 1 to stop. The env file is removed on exit so it never points at a released port.
+
+Notes:
+
+* No root is needed — standalone auto-selects an unprivileged port (unlike reverse mode, which defaults to privileged port 443).
+* Clients only trust the CA via the `*_CA_BUNDLE` / `SSL_CERT_FILE` / `CONDA_SSL_VERIFY` variables, so this exercises the *proxied* code path. Tools that ignore those variables (or bypass proxy env vars entirely) won't be intercepted; for those, use reverse mode.
+* `--cert-dir` overrides where the persistent CA and the `env` file live.
+
+## Reverse / Transparent Mode
+
+`--reverse` runs proxyspy as a standalone transparent MITM that emulates a **TLS-intercepting corporate firewall**: it listens on `127.0.0.1` (default port 443) and learns the target hostname from the TLS SNI field. You redirect the hostnames you want to watch to `127.0.0.1` in `/etc/hosts`, and the client connects to proxyspy normally — with no proxy configured and no idea a proxy exists.
+
+This matters because forward mode works by setting `HTTPS_PROXY`, so it can only exercise a client's *proxied* code path. Some clients behave differently with and without a proxy configured, so the proxied path is not a faithful stand-in for a user behind a transparent intercepting firewall. For example, in [conda/conda#16253](https://github.com/conda/conda/pull/16253) `requests` applied a `truststore` SSL context on its direct-connection path but dropped it on the separate proxy path, so verification against a MITM firewall's certificate silently failed *only* under a proxy. Reverse mode lets proxyspy intercept the TLS handshake while the client still takes its direct, no-proxy path, making that class of difference reproducible. The two modes are complementary test surfaces.
+
+Because `/etc/hosts` redirects the target hostnames to proxyspy itself, proxyspy cannot use the OS resolver to reach the real upstream once those entries are in place. It therefore resolves and caches each declared host's real IP **at startup** — so you must start proxyspy *before* editing `/etc/hosts`. If a declared host already resolves to a loopback address, proxyspy refuses to start and tells you to remove it from `/etc/hosts` or pin it with `--map HOST=IP`.
+
+Workflow:
+
+* Start proxyspy as root (port 443 is privileged), declaring the hosts to watch with `--prepare-host` (forward+log) or `--intercept-host` (return canned responses):
+  ```bash
+  sudo proxyspy --reverse --prepare-host repo.anaconda.com -l spy.log
+  ```
+* Trust the CA certificate it prints (default `~/.proxyspy/cert.pem`) in your client/system trust store. The CA persists across runs, so you only trust it once.
+* Add the redirects to `/etc/hosts`:
+  ```
+  127.0.0.1 repo.anaconda.com
+  ```
+* Run your client normally and watch `spy.log`.
+* Press Ctrl-C to stop proxyspy, then remove the `/etc/hosts` entries.
+
+Notes:
+
+* `--cert-dir` overrides where the persistent CA and host certificates live. Under `sudo`, the default `~/.proxyspy` resolves to the invoking user's home (via `SUDO_USER`), not root's.
+* `--map HOST=IP` pins an upstream IP, bypassing startup resolution. Use it when a host is already in `/etc/hosts`, or to target a specific backend.
+* A host listed only in `--intercept-host` (with no forwarding) never connects upstream, so it is not resolved.
+
+### Automatic `/etc/hosts` management (opt-in)
+
+Add `--manage-hosts` to have proxyspy add and remove the `/etc/hosts` redirects itself, so a session is self-contained: start it, use it, Ctrl-C, and the file is back to how it was. This replaces steps 3 and 5 of the manual workflow above; everything else (running as root, trusting the CA) is unchanged:
+
+```bash
+sudo proxyspy --reverse --manage-hosts --prepare-host repo.anaconda.com -l spy.log
+```
+
+proxyspy writes a fenced block to `/etc/hosts` containing only the redirects for the declared hosts, keeping a one-time backup at `/etc/hosts.proxyspy.bak`, and removes the block on a clean exit (Ctrl-C or SIGTERM). If a previous run is killed uncatchably (`SIGKILL`, power loss) and leaves the block behind, the next `--manage-hosts` start self-heals by removing it before resolving upstreams. To force-clean a stale block without starting proxyspy, run:
+
+```bash
+sudo proxyspy --restore-hosts
+```
+
+`--manage-hosts` and `--restore-hosts` are POSIX-only (they edit `/etc/hosts` directly) and require root, since editing `/etc/hosts` needs the same privileges as binding port 443.
 
 ## Development
 
