@@ -231,7 +231,7 @@ Add `--manage-hosts` to have proxyspy add and remove the `/etc/hosts` redirects 
 sudo proxyspy --reverse --manage-hosts --prepare-host repo.anaconda.com -l spy.log
 ```
 
-proxyspy writes a fenced block to `/etc/hosts` containing only the redirects for the declared hosts, keeping a one-time backup at `/etc/hosts.proxyspy.bak`, and removes the block on a clean exit (Ctrl-C or SIGTERM). If a previous run is killed uncatchably (`SIGKILL`, power loss) and leaves the block behind, the next `--manage-hosts` start self-heals by removing it before resolving upstreams. To force-clean a stale block without starting proxyspy, run:
+proxyspy writes a fenced block to `/etc/hosts` containing only the redirects for the declared hosts, keeping a one-time backup at `/etc/hosts.proxyspy.bak`, and removes the block on a clean exit (Ctrl-C or SIGTERM). The block's fences are tagged with the owning process's PID (e.g. `# >>> proxyspy 12345 >>>`), so concurrent `--manage-hosts` sessions do not clobber each other: each run removes only its own block on exit, and startup self-heal removes only blocks whose owner is no longer running. If a previous run is killed uncatchably (`SIGKILL`, power loss) and leaves the block behind, the next `--manage-hosts` start self-heals by removing it before resolving upstreams. To force-clean a stale block without starting proxyspy, run:
 
 ```bash
 sudo proxyspy --restore-hosts

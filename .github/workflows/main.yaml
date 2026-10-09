@@ -203,7 +203,7 @@ jobs:
       run: |
         if [ "$LABEL" = dry-run ]; then
           echo "Pull request; NOT publishing to the channel '$USER'."
-          anaconda --version
+          anaconda --help
         else
           echo "Publishing to conda: channel '$USER', label '$LABEL'."
           find dist/conda -name "*.tar.bz2" -o -name "*.conda" | while read file; do
