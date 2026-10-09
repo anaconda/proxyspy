@@ -94,7 +94,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 # Modified by our pre-commit hook
-__version__ = "0.2.0.post1"
+__version__ = "0.2.0.post2"
 
 # _forward_data buffer size
 BUFFER_SIZE = 65536
@@ -1168,7 +1168,6 @@ def main():
     server_thread = Thread(target=server.serve_forever)
     server_thread.daemon = True
     server_thread.start()
-    logger.info("Proxy server started on port %d", port)
 
     proxy_env = build_proxy_env(port, cert_path)
 
@@ -1182,6 +1181,10 @@ def main():
             logger.error("Cannot write env file %s: %s", env_file, exc)
             env_file = None
         logger.info("CA environment variable value: %s", cert_path)
+        # Announce readiness only after the env file is written, so a caller
+        # that waits for this line (as the tests do) can rely on the file
+        # already existing rather than racing the write.
+        logger.info("Proxy server started on port %d", port)
         # Always print the banner (the copy-pasteable exports are the primary
         # UX); env_file is None here if the source-able file could not be
         # written, in which case the "or just: source ..." line is omitted.
@@ -1212,6 +1215,8 @@ def main():
                 except OSError:
                     pass
         return 0
+
+    logger.info("Proxy server started on port %d", port)
 
     # Proxy configuration for the child process
     env = os.environ.copy()
