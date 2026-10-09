@@ -94,7 +94,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 # Modified by our pre-commit hook
-__version__ = "0.1.5.post43"
+__version__ = "0.2.0.post1"
 
 # _forward_data buffer size
 BUFFER_SIZE = 65536
@@ -635,29 +635,75 @@ def _chown_to_sudo_user(path):
 
 HOSTS_PATH = "/etc/hosts"
 HOSTS_BAK = "/etc/hosts.proxyspy.bak"
-FENCE_BEGIN = "# >>> proxyspy >>>"
-FENCE_END = "# <<< proxyspy <<<"
+FENCE_BEGIN = "# >>> proxyspy %d >>>"
+FENCE_END = "# <<< proxyspy %d <<<"
 
-# Non-greedy + DOTALL so multiple blocks are each stripped individually. An
-# unmatched FENCE_BEGIN (no following FENCE_END) is deliberately left alone
+# Each block's fences carry the owner PID (e.g. "# >>> proxyspy 12345 >>>") so
+# concurrent --manage-hosts sessions can tell their own block apart from other
+# live sessions' blocks. The PID group is optional so blocks written by older
+# versions (fence text alone) are still recognised and cleaned up.
+#
+# Non-greedy + DOTALL so multiple blocks are each matched individually. An
+# unmatched begin fence (no following end fence) is deliberately left alone
 # rather than consuming the rest of the file.
 _MANAGED_BLOCK_RE = re.compile(
-    re.escape(FENCE_BEGIN) + r".*?" + re.escape(FENCE_END) + r"\n?", re.DOTALL
+    r"^# >>> proxyspy(?: (?P<pid>\d+))? >>>\n" r".*?" r"^# <<< proxyspy(?: \d+)? <<<\n?",
+    re.DOTALL | re.MULTILINE,
 )
 
 
-def _strip_managed_block(text):
-    """Remove the fenced proxyspy block(s) from text, if present. Pure
-    string in/string out so it is trivially unit-testable; idempotent if no
-    block is present."""
-    return _MANAGED_BLOCK_RE.sub("", text)
+def _pid_alive(pid):
+    """Return True if a live process currently holds PID. POSIX-only, which
+    matches the rest of /etc/hosts management (--manage-hosts is POSIX-only)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # The PID exists but belongs to another user.
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _strip_managed_block(text, keep=None):
+    """Remove the fenced proxyspy block(s) from text, if present, keeping any
+    block for which keep(owner_pid) returns True.
+
+    owner_pid is the PID recorded in the block's fence, or None for a legacy
+    block written before fences carried a PID. With keep=None every block is
+    removed. Pure string in/string out so it is trivially unit-testable;
+    idempotent if no block is present."""
+
+    def _replace(match):
+        owner = match.group("pid")
+        owner_pid = int(owner) if owner is not None else None
+        if keep is not None and keep(owner_pid):
+            return match.group(0)
+        return ""
+
+    return _MANAGED_BLOCK_RE.sub(_replace, text)
+
+
+def _keep_live_foreign_block(owner_pid):
+    """Keep predicate for _strip_managed_block: keep a block only if it belongs
+    to a different, still-running proxyspy process. Legacy blocks (owner_pid
+    None) are never kept, since their owner cannot be confirmed alive."""
+    return owner_pid is not None and owner_pid != os.getpid() and _pid_alive(owner_pid)
 
 
 def _fenced_block(hosts):
-    """Build the fenced block text (including trailing newline) for hosts."""
-    lines = [FENCE_BEGIN, "# Managed by proxyspy (PID %d). Do not edit by hand." % os.getpid()]
+    """Build the fenced block text (including trailing newline) for hosts. The
+    owner PID appears in both fences so the block can be attributed to this
+    process."""
+    pid = os.getpid()
+    lines = [
+        FENCE_BEGIN % pid,
+        "# Managed by proxyspy (PID %d). Do not edit by hand." % pid,
+    ]
     lines.extend("127.0.0.1 %s" % host for host in sorted(hosts))
-    lines.append(FENCE_END)
+    lines.append(FENCE_END % pid)
     return "\n".join(lines) + "\n"
 
 
@@ -695,8 +741,11 @@ def _atomic_write(path, text):
 
 
 def write_managed_hosts(hosts, hosts_path=HOSTS_PATH, bak_path=HOSTS_BAK):
-    """Write the fenced managed block for hosts into hosts_path, replacing
-    any existing block. Backs up hosts_path to bak_path once, on first
+    """Write the fenced managed block for hosts into hosts_path, replacing any
+    block this process previously wrote (so restarts are idempotent) and
+    cleaning up blocks left by dead processes. A block owned by another *live*
+    proxyspy process is left untouched, so concurrent --manage-hosts sessions
+    do not clobber each other. Backs up hosts_path to bak_path once, on first
     mutation; the backup is never overwritten or touched by removal."""
     try:
         with open(hosts_path) as f:
@@ -706,21 +755,41 @@ def write_managed_hosts(hosts, hosts_path=HOSTS_PATH, bak_path=HOSTS_BAK):
     else:
         if not os.path.exists(bak_path):
             shutil.copy2(hosts_path, bak_path)
-    stripped = _strip_managed_block(current)
+    stripped = _strip_managed_block(current, keep=_keep_live_foreign_block)
     if stripped and not stripped.endswith("\n"):
         stripped += "\n"
     _atomic_write(hosts_path, stripped + _fenced_block(hosts))
 
 
-def remove_managed_hosts(hosts_path=HOSTS_PATH):
-    """Strip the managed block from hosts_path if present. Returns True if
-    a block was found and removed, False if the file was already clean."""
+def remove_managed_hosts(hosts_path=HOSTS_PATH, pid=None, drop_dead=False):
+    """Strip proxyspy-managed block(s) from hosts_path if present. Returns True
+    if a block was found and removed, False if the file was already clean.
+
+    With no arguments every proxyspy block is removed (the purpose of
+    --restore-hosts). pid=<int> removes only the block owned by that PID, so a
+    clean exit leaves other sessions' blocks alone. drop_dead=True removes only
+    blocks whose owner is no longer running, so startup self-heal clears a
+    stale block without touching a concurrent live session."""
     try:
         with open(hosts_path) as f:
             current = f.read()
     except FileNotFoundError:
         return False
-    stripped = _strip_managed_block(current)
+
+    if pid is not None:
+
+        def keep(owner):
+            return owner != pid
+
+    elif drop_dead:
+
+        def keep(owner):
+            return owner is not None and _pid_alive(owner)
+
+    else:
+        keep = None
+
+    stripped = _strip_managed_block(current, keep=keep)
     if stripped == current:
         return False
     _atomic_write(hosts_path, stripped)
@@ -1027,10 +1096,12 @@ def main():
 
         # Self-heal before resolving: a managed block left behind by a prior
         # run that died uncleanly (e.g. SIGKILL) would make the OS resolver
-        # return our own loopback address instead of the real upstream.
+        # return our own loopback address instead of the real upstream. Only
+        # blocks whose owner is no longer running are removed, so a concurrent
+        # live --manage-hosts session is left alone.
         if args.manage_hosts:
             try:
-                if remove_managed_hosts():
+                if remove_managed_hosts(drop_dead=True):
                     logger.info("Self-heal: removed a stale /etc/hosts block from a previous run")
             except PermissionError as exc:
                 logger.error("Cannot modify /etc/hosts: %s", exc)
@@ -1088,7 +1159,7 @@ def main():
             server.server_close()
             if args.manage_hosts:
                 try:
-                    if remove_managed_hosts():
+                    if remove_managed_hosts(pid=os.getpid()):
                         logger.info("Removed /etc/hosts redirects")
                 except PermissionError as exc:
                     logger.error("Failed to remove /etc/hosts redirects: %s", exc)

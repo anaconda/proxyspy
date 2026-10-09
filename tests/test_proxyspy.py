@@ -6,6 +6,7 @@ import shutil
 import socket
 import ssl
 import subprocess
+import sys
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -1239,6 +1240,30 @@ def test_standalone_forwards_request(standalone, origin):
 #
 
 
+def _fenced(host, pid):
+    """Build a PID-tagged managed block, matching proxyspy._fenced_block."""
+    return (
+        "# >>> proxyspy %d >>>\n"
+        "# Managed by proxyspy (PID %d). Do not edit by hand.\n"
+        "127.0.0.1 %s\n"
+        "# <<< proxyspy %d <<<\n" % (pid, pid, host, pid)
+    )
+
+
+def _live_foreign_pid():
+    """A PID that is currently alive and is not ours (our parent process)."""
+    parent = psutil.Process(os.getpid()).parent()
+    assert parent is not None
+    return parent.pid
+
+
+def _dead_pid():
+    """A PID that is no longer running: a child we spawned and reaped."""
+    proc = subprocess.Popen([sys.executable, "-c", ""])
+    proc.wait()
+    return proc.pid
+
+
 def test_strip_managed_block_absent():
     text = "127.0.0.1 localhost\n::1 localhost\n"
     assert proxyspy._strip_managed_block(text) == text
@@ -1287,6 +1312,35 @@ def test_strip_managed_block_unterminated_begin():
     assert proxyspy._strip_managed_block(text) == text
 
 
+def test_strip_managed_block_pid_tagged():
+    text = (
+        "127.0.0.1 localhost\n"
+        "# >>> proxyspy 4242 >>>\n"
+        "# Managed by proxyspy (PID 4242). Do not edit by hand.\n"
+        "127.0.0.1 example.com\n"
+        "# <<< proxyspy 4242 <<<\n"
+        "::1 localhost\n"
+    )
+    assert proxyspy._strip_managed_block(text) == "127.0.0.1 localhost\n::1 localhost\n"
+
+
+def test_strip_managed_block_keeps_live_foreign_block():
+    """_keep_live_foreign_block keeps a block owned by another live process
+    while still removing this process's own block."""
+    foreign = _live_foreign_pid()
+    mine = os.getpid()
+    text = _fenced("a.example.com", foreign) + _fenced("b.example.com", mine)
+    stripped = proxyspy._strip_managed_block(text, keep=proxyspy._keep_live_foreign_block)
+    assert "127.0.0.1 a.example.com" in stripped
+    assert "b.example.com" not in stripped
+
+
+def test_strip_managed_block_drops_dead_block():
+    text = _fenced("a.example.com", _dead_pid())
+    stripped = proxyspy._strip_managed_block(text, keep=proxyspy._keep_live_foreign_block)
+    assert stripped == ""
+
+
 def test_write_managed_hosts_appends_block(tmp_path):
     hosts_path = tmp_path / "hosts"
     bak_path = tmp_path / "hosts.bak"
@@ -1298,8 +1352,8 @@ def test_write_managed_hosts_appends_block(tmp_path):
 
     text = hosts_path.read_text()
     assert text.startswith("127.0.0.1 localhost\n")
-    assert "# >>> proxyspy >>>" in text
-    assert "# <<< proxyspy <<<" in text
+    assert "# >>> proxyspy %d >>>" % os.getpid() in text
+    assert "# <<< proxyspy %d <<<" % os.getpid() in text
     assert "127.0.0.1 example.com" in text
     assert "127.0.0.1 example.org" in text
     # Hosts are sorted within the block
@@ -1319,7 +1373,7 @@ def test_write_managed_hosts_idempotent_across_restarts(tmp_path):
     )
 
     text = hosts_path.read_text()
-    assert text.count("# >>> proxyspy >>>") == 1
+    assert text.count("# >>> proxyspy %d >>>" % os.getpid()) == 1
     assert "example.com" not in text
     assert "127.0.0.1 example.org" in text
     assert text.startswith("127.0.0.1 localhost\n")
@@ -1362,6 +1416,98 @@ def test_remove_managed_hosts_noop_when_absent(tmp_path):
 
     assert proxyspy.remove_managed_hosts(hosts_path=str(hosts_path)) is False
     assert hosts_path.read_text() == original
+
+
+def test_write_managed_hosts_preserves_live_foreign_block(tmp_path):
+    """A concurrent live session's block must survive our write, so we do not
+    silently stop intercepting for that session."""
+    hosts_path = tmp_path / "hosts"
+    bak_path = tmp_path / "hosts.bak"
+    foreign = _live_foreign_pid()
+    hosts_path.write_text("127.0.0.1 localhost\n" + _fenced("a.example.com", foreign))
+
+    proxyspy.write_managed_hosts(
+        ["b.example.com"], hosts_path=str(hosts_path), bak_path=str(bak_path)
+    )
+
+    text = hosts_path.read_text()
+    assert "127.0.0.1 a.example.com" in text
+    assert "127.0.0.1 b.example.com" in text
+    assert text.count("# >>> proxyspy") == 2
+
+
+def test_write_managed_hosts_drops_dead_block(tmp_path):
+    hosts_path = tmp_path / "hosts"
+    bak_path = tmp_path / "hosts.bak"
+    hosts_path.write_text("127.0.0.1 localhost\n" + _fenced("a.example.com", _dead_pid()))
+
+    proxyspy.write_managed_hosts(
+        ["b.example.com"], hosts_path=str(hosts_path), bak_path=str(bak_path)
+    )
+
+    text = hosts_path.read_text()
+    assert "a.example.com" not in text
+    assert "127.0.0.1 b.example.com" in text
+    assert text.count("# >>> proxyspy") == 1
+
+
+def test_remove_managed_hosts_pid_removes_only_own(tmp_path):
+    """Clean exit strips only our own PID's block, leaving a concurrent live
+    session's block in place."""
+    hosts_path = tmp_path / "hosts"
+    foreign = _live_foreign_pid()
+    mine = os.getpid()
+    hosts_path.write_text(
+        "127.0.0.1 localhost\n" + _fenced("a.example.com", foreign) + _fenced("b.example.com", mine)
+    )
+
+    assert proxyspy.remove_managed_hosts(hosts_path=str(hosts_path), pid=mine) is True
+
+    text = hosts_path.read_text()
+    assert "127.0.0.1 a.example.com" in text
+    assert "b.example.com" not in text
+
+
+def test_remove_managed_hosts_drop_dead_keeps_live(tmp_path):
+    """Startup self-heal removes a stale block but never a live foreign one."""
+    hosts_path = tmp_path / "hosts"
+    foreign = _live_foreign_pid()
+    hosts_path.write_text(
+        "127.0.0.1 localhost\n"
+        + _fenced("a.example.com", foreign)
+        + _fenced("b.example.com", _dead_pid())
+    )
+
+    assert proxyspy.remove_managed_hosts(hosts_path=str(hosts_path), drop_dead=True) is True
+
+    text = hosts_path.read_text()
+    assert "127.0.0.1 a.example.com" in text
+    assert "b.example.com" not in text
+
+
+def test_remove_managed_hosts_drop_dead_noop_when_all_live(tmp_path):
+    hosts_path = tmp_path / "hosts"
+    foreign = _live_foreign_pid()
+    hosts_path.write_text("127.0.0.1 localhost\n" + _fenced("a.example.com", foreign))
+
+    assert proxyspy.remove_managed_hosts(hosts_path=str(hosts_path), drop_dead=True) is False
+    assert "127.0.0.1 a.example.com" in hosts_path.read_text()
+
+
+def test_remove_managed_hosts_restore_removes_live_block(tmp_path):
+    """--restore-hosts removes every proxyspy block, live or not."""
+    hosts_path = tmp_path / "hosts"
+    foreign = _live_foreign_pid()
+    hosts_path.write_text("127.0.0.1 localhost\n" + _fenced("a.example.com", foreign))
+
+    assert proxyspy.remove_managed_hosts(hosts_path=str(hosts_path)) is True
+    assert hosts_path.read_text() == "127.0.0.1 localhost\n"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="PID liveness check is POSIX-only")
+def test_pid_alive():
+    assert proxyspy._pid_alive(os.getpid()) is True
+    assert proxyspy._pid_alive(_dead_pid()) is False
 
 
 @pytest.mark.skipif(os.name != "posix", reason="permission bits are POSIX-only")
@@ -1476,7 +1622,7 @@ class TestManageHostsIntegration:
                 "418",
             )
             hosts_text = Path(proxyspy.HOSTS_PATH).read_text()
-            assert "# >>> proxyspy >>>" in hosts_text
+            assert proxyspy._MANAGED_BLOCK_RE.search(hosts_text)
             assert f"127.0.0.1 {self.HOST}" in hosts_text
 
             sock = harness.connect(self.HOST)
@@ -1498,11 +1644,11 @@ class TestManageHostsIntegration:
         harness = ReverseHarness(tmp_path)
         try:
             harness.start("--manage-hosts", "--intercept-host", self.HOST, "--return-code", "418")
-            assert "# >>> proxyspy >>>" in Path(proxyspy.HOSTS_PATH).read_text()
+            assert proxyspy._MANAGED_BLOCK_RE.search(Path(proxyspy.HOSTS_PATH).read_text())
 
             harness.process.kill()
             harness.process.wait(timeout=5)
-            assert "# >>> proxyspy >>>" in Path(proxyspy.HOSTS_PATH).read_text()
+            assert proxyspy._MANAGED_BLOCK_RE.search(Path(proxyspy.HOSTS_PATH).read_text())
 
             harness2 = ReverseHarness(tmp_path)
             try:
