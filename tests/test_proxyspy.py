@@ -35,6 +35,12 @@ EXCEPTIONS = ConnectionError, ProxyError, ReadTimeout, RequestException, MaxRetr
 # loopback without DNS and the origin's certificate is valid for it.
 ORIGIN_HOST = "localhost"
 
+# Hostname the --map tests send through the proxy. It never resolves (.invalid),
+# so a passing test proves the traffic went to the mapped upstream and not to a
+# real host. The origin's certificate is also valid for it, so an https:// map
+# can still verify the upstream against the original name.
+MAPPED_HOST = "proxyspy-mapped.invalid"
+
 
 def _robust_rmtree(path, attempts=5):
     """shutil.rmtree that tolerates Windows' lag in releasing file/dir handles
@@ -68,7 +74,11 @@ def _make_origin_cert(cert_dir):
         .not_valid_after(datetime.now(timezone.utc) + timedelta(days=365))
         .add_extension(
             x509.SubjectAlternativeName(
-                [x509.DNSName(ORIGIN_HOST), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]
+                [
+                    x509.DNSName(ORIGIN_HOST),
+                    x509.DNSName(MAPPED_HOST),
+                    x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+                ]
             ),
             critical=False,
         )
@@ -91,7 +101,9 @@ def _make_origin_cert(cert_dir):
 
 class _OriginHandler(BaseHTTPRequestHandler):
     """Minimal stand-in for the httpbin endpoints the tests exercise:
-    /get (JSON echo), /bytes/<n> (n bytes), and ?ndx=N query echo on /get."""
+    /get (JSON echo), /bytes/<n> (n bytes), and ?ndx=N query echo on /get.
+    The /get echo also reports whether the request arrived over TLS, so the
+    --map tests can tell which origin served it."""
 
     def log_message(self, *args):
         pass  # keep test output quiet
@@ -99,7 +111,13 @@ class _OriginHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         if path == "/get":
-            body = json.dumps({"url": self.path, "headers": dict(self.headers)}).encode()
+            body = json.dumps(
+                {
+                    "url": self.path,
+                    "headers": dict(self.headers),
+                    "tls": isinstance(self.connection, ssl.SSLSocket),
+                }
+            ).encode()
             self._respond(200, body, "application/json")
         elif path.startswith("/bytes/"):
             try:
@@ -121,14 +139,17 @@ class _OriginHandler(BaseHTTPRequestHandler):
 
 class LocalOrigin:
     """In-process HTTPS origin so the forwarding tests don't depend on a public
-    server. Cross-platform and available to local `pytest` runs."""
+    server. Cross-platform and available to local `pytest` runs. With
+    tls=False it serves plain HTTP instead (a stand-in for a local dev server
+    such as `wrangler dev`)."""
 
-    def __init__(self, cert_dir):
-        self.cert_path, self.key_path = _make_origin_cert(cert_dir)
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ctx.load_cert_chain(self.cert_path, self.key_path)
+    def __init__(self, cert_dir, tls=True):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), _OriginHandler)
-        self.server.socket = ctx.wrap_socket(self.server.socket, server_side=True)
+        if tls:
+            self.cert_path, self.key_path = _make_origin_cert(cert_dir)
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(self.cert_path, self.key_path)
+            self.server.socket = ctx.wrap_socket(self.server.socket, server_side=True)
         self.port = self.server.server_address[1]
         self.thread = Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -146,6 +167,16 @@ class LocalOrigin:
 def origin(tmp_path):
     """A running in-process HTTPS origin; yields the LocalOrigin instance."""
     server = LocalOrigin(str(tmp_path))
+    try:
+        yield server
+    finally:
+        server.stop()
+
+
+@pytest.fixture
+def plain_origin(tmp_path):
+    """A running in-process plain-HTTP origin; yields the LocalOrigin instance."""
+    server = LocalOrigin(str(tmp_path), tls=False)
     try:
         yield server
     finally:
@@ -836,6 +867,122 @@ def test_sequential_proxy_starts(tmp_path):
 
 
 #
+# Upstream mapping (--map) in forward mode
+#
+
+
+def test_forward_map_http_upstream(proxy, session, origin, plain_origin):
+    """--map HOST=http://... sends a host's decrypted traffic to a plain-HTTP
+    upstream, relaying the request unchanged (Host header included), while
+    other hosts in the same run still reach their real destinations."""
+    proxy.start_proxy(
+        "--map", f"{MAPPED_HOST}=http://127.0.0.1:{plain_origin.port}", trust=origin.cert_path
+    )
+
+    resp = session.get(f"https://{MAPPED_HOST}/get?via=map", timeout=10)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["tls"] is False, "mapped request should reach the plain-HTTP origin"
+    assert data["headers"]["Host"] == MAPPED_HOST
+    assert data["url"] == "/get?via=map"
+    proxy.assert_log_contains(f"Host {MAPPED_HOST} mapped to http://127.0.0.1:{plain_origin.port}")
+    proxy.assert_log_contains("[P<>S] Plain TCP connection established")
+
+    # Unmapped passthrough: the TLS origin is reached via its CONNECT target.
+    resp = session.get(f"{origin.base_url}/get", timeout=10)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["tls"] is True, "unmapped request should reach its real (TLS) destination"
+    assert data["headers"]["Host"] == f"{ORIGIN_HOST}:{origin.port}"
+    proxy.get_logs(force=True)
+    proxy.assert_log_contains("[P<>S] SSL handshake completed")
+    assert not any(f"Host {ORIGIN_HOST} mapped" in line for line in proxy.get_logs())
+
+
+def test_forward_map_https_upstream(proxy, session, origin):
+    """--map HOST=https://H:P dials H:P over TLS but verifies the upstream
+    certificate against the original HOST name."""
+    proxy.start_proxy(
+        "--map", f"{MAPPED_HOST}=https://127.0.0.1:{origin.port}", trust=origin.cert_path
+    )
+
+    resp = session.get(f"https://{MAPPED_HOST}/get", timeout=10)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["tls"] is True
+    assert data["headers"]["Host"] == MAPPED_HOST
+    proxy.assert_log_contains(f"Host {MAPPED_HOST} mapped to https://127.0.0.1:{origin.port}")
+    proxy.assert_log_contains("[P<>S] SSL handshake completed")
+
+
+def test_forward_map_ip_port_upstream(proxy, session, origin):
+    """--map HOST=IP:PORT is TLS to that address and port."""
+    proxy.start_proxy("--map", f"{MAPPED_HOST}=127.0.0.1:{origin.port}", trust=origin.cert_path)
+
+    resp = session.get(f"https://{MAPPED_HOST}/get", timeout=10)
+    assert resp.status_code == 200
+    assert resp.json()["tls"] is True
+    proxy.assert_log_contains(f"Host {MAPPED_HOST} mapped to https://127.0.0.1:{origin.port}")
+
+
+def test_forward_map_bare_ip_uses_connect_port(proxy, session, origin):
+    """In forward mode a bare --map HOST=IP pins the address but keeps the
+    port from the CONNECT request."""
+    proxy.start_proxy("--map", f"{MAPPED_HOST}=127.0.0.1", trust=origin.cert_path)
+
+    resp = session.get(f"https://{MAPPED_HOST}:{origin.port}/get", timeout=10)
+    assert resp.status_code == 200
+    assert resp.json()["tls"] is True
+    proxy.assert_log_contains(f"Host {MAPPED_HOST} mapped to https://127.0.0.1:{origin.port}")
+
+
+def test_forward_map_invalid_value():
+    result = _run_proxyspy_cli("--map", f"{MAPPED_HOST}=ftp://127.0.0.1", "--", "echo", "hi")
+    assert result.returncode == 2
+    assert "unsupported scheme" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "value, default_port, expected",
+    [
+        ("10.0.0.1", 443, ("https", "10.0.0.1", 443)),
+        ("10.0.0.1", None, ("https", "10.0.0.1", None)),
+        ("backend.example", 8443, ("https", "backend.example", 8443)),
+        ("10.0.0.1:8443", None, ("https", "10.0.0.1", 8443)),
+        ("https://10.0.0.1", None, ("https", "10.0.0.1", 443)),
+        ("https://10.0.0.1:8443", 443, ("https", "10.0.0.1", 8443)),
+        ("HTTPS://Backend.Example/", None, ("https", "backend.example", 443)),
+        ("http://127.0.0.1", 443, ("http", "127.0.0.1", 80)),
+        ("http://127.0.0.1:8787", None, ("http", "127.0.0.1", 8787)),
+        # IPv6 literals are out of scope, but must not be misparsed as IP:PORT
+        ("::1", 443, ("https", "::1", 443)),
+    ],
+)
+def test_parse_upstream(value, default_port, expected):
+    assert tuple(proxyspy.parse_upstream(value, default_port)) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "ftp://10.0.0.1",
+        "http://",
+        "http://127.0.0.1:notaport",
+        "http://127.0.0.1:0",
+        "http://127.0.0.1:8787/path",
+        "http://127.0.0.1:8787?q=1",
+        "http://user:pw@127.0.0.1",
+        "10.0.0.1:notaport",
+        "10.0.0.1:70000",
+        ":8443",
+    ],
+)
+def test_parse_upstream_rejects(value):
+    with pytest.raises(ValueError):
+        proxyspy.parse_upstream(value, 443)
+
+
+#
 # Reverse / transparent mode
 #
 
@@ -1015,6 +1162,35 @@ def test_reverse_loopback_guard(reverse):
 
     assert reverse.process.returncode == 1
     assert "loopback address" in reverse.logs()
+
+
+def _read_all(sock):
+    """Read from sock until the peer closes it."""
+    response = b""
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            return response
+        response += chunk
+
+
+def test_reverse_map_http_upstream(reverse, plain_origin):
+    """Reverse mode honors an explicit http:// --map (no upstream TLS), even
+    to loopback and even when the host is not otherwise declared."""
+    reverse.start("--map", f"{MAPPED_HOST}=http://127.0.0.1:{plain_origin.port}")
+    assert f"Upstream for {MAPPED_HOST} -> http://127.0.0.1:{plain_origin.port}" in reverse.logs()
+
+    sock = reverse.connect(MAPPED_HOST)
+    sock.sendall(f"GET /get HTTP/1.1\r\nHost: {MAPPED_HOST}\r\nConnection: close\r\n\r\n".encode())
+    response = _read_all(sock)
+    sock.close()
+
+    head, _, body = response.partition(b"\r\n\r\n")
+    assert b" 200 " in head.split(b"\r\n", 1)[0], head
+    data = json.loads(body)
+    assert data["tls"] is False
+    assert data["headers"]["Host"] == MAPPED_HOST
+    assert "[P<>S] Plain TCP connection established" in reverse.logs()
 
 
 #

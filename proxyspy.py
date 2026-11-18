@@ -41,7 +41,8 @@ Arguments:
     --manage-hosts        Auto-manage /etc/hosts redirects (reverse mode; POSIX only)
     --restore-hosts       Remove any proxyspy-managed /etc/hosts block and exit
     --cert-dir DIR        Persistent certificate directory (reverse: ~/.proxyspy)
-    --map HOST=IP         Pin the real upstream IP for HOST (reverse; can repeat)
+    --map HOST=UPSTREAM   Send HOST's traffic to UPSTREAM instead (can repeat);
+                          UPSTREAM is IP, IP:PORT, https://H[:P] or http://H[:P]
     --upstream-port PORT  Upstream port to dial in reverse mode (default: 443)
 
 Examples:
@@ -56,6 +57,10 @@ Examples:
                   --return-header "Content-Type: application/json" \\
                   --return-data '{"status": "ok"}' \\
                   -- ./my_script.py
+
+    # Put a local plain-HTTP service in front of a real HTTPS host for one
+    # client; other hosts are tunneled to their real destinations:
+    ./proxyspy.py --map example.com=http://127.0.0.1:8787 -- curl https://example.com/x
 
     # Standalone forward proxy; set the printed vars in another shell:
     ./proxyspy.py --standalone -l spy.log
@@ -83,11 +88,13 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import namedtuple
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from os.path import isfile, join
 from threading import Lock, Thread
+from urllib.parse import urlsplit
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -95,7 +102,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 # Modified by our pre-commit hook
-__version__ = "0.2.0.post2"
+__version__ = "0.2.0.post4"
 
 # _forward_data buffer size
 BUFFER_SIZE = 65536
@@ -243,6 +250,67 @@ def read_or_create_cert(host=None):
 #
 
 
+# Where a tunnel's decrypted traffic is sent. scheme is "https" (wrap the
+# upstream socket in TLS, verified against the original host name) or "http"
+# (plain TCP, no upstream TLS). port may be None for a bare --map HOST=IP
+# value in forward mode, meaning "use the CONNECT port".
+Upstream = namedtuple("Upstream", "scheme address port")
+
+DEFAULT_PORTS = {"https": 443, "http": 80}
+
+
+def parse_upstream(value, default_port=None):
+    """Parse a --map upstream value into an Upstream record.
+
+    Accepted forms:
+      IP or NAME           TLS to that address, port default_port
+      IP:PORT              TLS to that address and port
+      https://H[:P]        TLS to H:P (P defaults to 443)
+      http://H[:P]         plain TCP to H:P (P defaults to 80)
+
+    A value with more than one colon and no scheme is treated as a bare
+    address (e.g. an IPv6 literal) rather than misparsed as IP:PORT. Raises
+    ValueError with a human-readable message on malformed input."""
+    if "://" in value:
+        parts = urlsplit(value)
+        scheme = parts.scheme.lower()
+        if scheme not in DEFAULT_PORTS:
+            raise ValueError("unsupported scheme %r (use http or https)" % parts.scheme)
+        if parts.username is not None or parts.password is not None:
+            raise ValueError("credentials are not supported in an upstream URL")
+        if parts.path not in ("", "/") or parts.query or parts.fragment:
+            raise ValueError("an upstream URL must not include a path, query or fragment")
+        if not parts.hostname:
+            raise ValueError("missing host in upstream URL")
+        try:
+            port = parts.port
+        except ValueError:
+            raise ValueError("invalid port in upstream URL") from None
+        if port == 0:
+            raise ValueError("port 0 out of range")
+        return Upstream(scheme, parts.hostname, port or DEFAULT_PORTS[scheme])
+    if value.count(":") == 1:
+        address, _, port = value.partition(":")
+        if not address:
+            raise ValueError("missing address")
+        try:
+            port = int(port)
+        except ValueError:
+            raise ValueError("invalid port %r" % port) from None
+        if not 0 < port < 65536:
+            raise ValueError("port %d out of range" % port)
+        return Upstream("https", address, port)
+    if not value:
+        raise ValueError("missing address")
+    return Upstream("https", value, default_port)
+
+
+def format_upstream(upstream):
+    """Human-readable form of an Upstream for log messages."""
+    port = "<connect port>" if upstream.port is None else upstream.port
+    return "%s://%s:%s" % (upstream.scheme, upstream.address, port)
+
+
 class MyHTTPServer(ThreadingHTTPServer):
     """Thread-per-connection server, used for both the forward (ProxyHandler)
     and reverse (ReverseHandler) modes; the handler decides how to read the
@@ -263,8 +331,10 @@ class MyHTTPServer(ThreadingHTTPServer):
         self.return_headers = []  # List of (name, value) tuples
         self.return_data = ""  # Response body
         self.delay = 0
-        # Reverse mode only: host -> (ip, port) upstreams and the SNI context
+        # host -> Upstream overrides. Forward mode holds only --map entries;
+        # reverse mode also holds the declared hosts resolved at startup.
         self.upstream = {}
+        # Reverse mode only: the SNI-dispatching server context
         self.base_context = None
 
 
@@ -335,13 +405,15 @@ class ConnLoggingMixin:
                 current = time.perf_counter()
             self._log("End of connection delay")
 
-    def _serve_tunnel(self, client, host, upstream_addr):
+    def _serve_tunnel(self, client, host, upstream):
         """Service a decrypted client tunnel: either return a canned response
-        (interception) or forward to the real upstream while logging traffic.
+        (interception) or forward to the upstream while logging traffic.
 
         host drives intercept matching and the upstream SNI/verification name;
-        upstream_addr is the (address, port) actually dialed when forwarding,
-        which may differ from host (e.g. a pre-resolved IP in reverse mode)."""
+        upstream is the Upstream actually dialed when forwarding, which may
+        differ from host (e.g. a pre-resolved IP in reverse mode, or a --map
+        override). An "http" upstream is dialed without TLS; the decrypted
+        bytes are relayed unchanged either way."""
         should_intercept = self.server.intercept_mode
         if should_intercept and self.server.intercept_hosts:
             should_intercept = host in self.server.intercept_hosts
@@ -374,15 +446,20 @@ class ConnLoggingMixin:
                 client.sendall(data)
                 self._log("[P->C] %d data bytes delivered", len(data))
         else:
-            # Create SSL context for the server connection (verify remote)
             remote = None
             try:
-                self._log("About to create connection to %s:%d", *upstream_addr)
-                remote = socket.create_connection(upstream_addr)
-                self._log("About to wrap socket")
-                server_context = ssl.create_default_context()
-                remote = server_context.wrap_socket(remote, server_hostname=host)
-                self._log("[P<>S] SSL handshake completed")
+                address = (upstream.address, upstream.port)
+                self._log("About to create %s connection to %s:%d", upstream.scheme, *address)
+                remote = socket.create_connection(address)
+                if upstream.scheme == "http":
+                    self._log("[P<>S] Plain TCP connection established (no upstream TLS)")
+                else:
+                    # Verify the upstream against the original host name, even
+                    # when dialing a different address.
+                    self._log("About to wrap socket")
+                    server_context = ssl.create_default_context()
+                    remote = server_context.wrap_socket(remote, server_hostname=host)
+                    self._log("[P<>S] SSL handshake completed")
                 # Forward all requests to the real server
                 self._forward_data(client, remote)
             finally:
@@ -482,8 +559,17 @@ class ProxyHandler(ConnLoggingMixin, BaseHTTPRequestHandler):
             client = client_context.wrap_socket(self.connection, server_side=True)
             self._log("[C<>P] SSL handshake completed")
 
-            # Forward mode resolves the host normally (/etc/hosts untouched here)
-            self._serve_tunnel(client, host, (host, int(port)))
+            # A --map override redirects this host's decrypted traffic; a bare
+            # HOST=IP override inherits the CONNECT port. Unmapped hosts go to
+            # the CONNECT target, resolved normally.
+            upstream = self.server.upstream.get(host)
+            if upstream is None:
+                upstream = Upstream("https", host, int(port))
+            else:
+                if upstream.port is None:
+                    upstream = upstream._replace(port=int(port))
+                self._log("Host %s mapped to %s", host, format_upstream(upstream))
+            self._serve_tunnel(client, host, upstream)
 
         except ssl.SSLError as ssl_err:
             self._log("SSL error: %s", ssl_err, level="error")
@@ -529,9 +615,10 @@ class ReverseHandler(ConnLoggingMixin, socketserver.BaseRequestHandler):
 
             upstream = self.server.upstream.get(host)
             if upstream is None:
-                # Not a declared host: fall back to resolving the SNI name. This
-                # only succeeds if it is not redirected to us in /etc/hosts.
-                upstream = (host, 443)
+                # Not a declared or mapped host: fall back to resolving the SNI
+                # name. This only succeeds if it is not redirected to us in
+                # /etc/hosts.
+                upstream = Upstream("https", host, 443)
             self._serve_tunnel(client, host, upstream)
 
         except ssl.SSLError as ssl_err:
@@ -577,18 +664,20 @@ def make_sni_context():
 
 
 def resolve_upstream(host, port, overrides):
-    """Resolve host to a real (ip, port) upstream, preferring --map overrides.
-    Refuses a loopback result unless pinned, since that means the host is
-    already redirected to us in /etc/hosts and forwarding would loop back."""
+    """Resolve host to a real Upstream, preferring --map overrides (a dict of
+    host -> Upstream). Refuses a loopback result unless mapped, since that
+    means the host is already redirected to us in /etc/hosts and forwarding
+    would loop back. A --map value is explicit, so it is never checked."""
     if host in overrides:
-        return overrides[host], port
+        upstream = overrides[host]
+        return upstream if upstream.port is not None else upstream._replace(port=port)
     ip = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)[0][4][0]
     if ipaddress.ip_address(ip).is_loopback:
         raise RuntimeError(
             "%s already resolves to a loopback address (%s); remove it from "
             "/etc/hosts before starting, or pin it with --map %s=<ip>" % (host, ip, host)
         )
-    return ip, port
+    return Upstream("https", ip, port)
 
 
 def _sudo_pw():
@@ -975,9 +1064,15 @@ def main():
     parser.add_argument(
         "--map",
         action="append",
-        metavar="HOST=IP",
-        help="Pin the real upstream IP for HOST, bypassing DNS (reverse mode; can be repeated). "
-        "Use this when HOST is already redirected to 127.0.0.1 in /etc/hosts.",
+        metavar="HOST=UPSTREAM",
+        help="Send HOST's decrypted traffic to UPSTREAM instead of its real address "
+        "(forward and reverse modes; can be repeated). UPSTREAM is one of: IP (TLS; "
+        "port from the CONNECT request in forward mode, --upstream-port in reverse "
+        "mode), IP:PORT (TLS), https://H[:P] (TLS, default port 443), or "
+        "http://H[:P] (plain HTTP, default port 80). TLS upstreams are verified "
+        "against HOST. The request itself is relayed unchanged (including the Host "
+        "header). In reverse mode, use this when HOST is already redirected to "
+        "127.0.0.1 in /etc/hosts.",
     )
     parser.add_argument(
         "--upstream-port",
@@ -1051,13 +1146,19 @@ def main():
         if reasons:
             parser.error("this requires root (sudo): %s" % " and ".join(reasons))
 
-    # Parse --map HOST=IP overrides
+    # Parse --map HOST=UPSTREAM overrides. A bare HOST=IP takes its port from
+    # --upstream-port in reverse mode, or from the CONNECT request in forward
+    # mode (port left as None until the request arrives).
     overrides = {}
+    default_map_port = args.upstream_port if args.reverse else None
     for entry in args.map or []:
-        host, sep, ip = entry.partition("=")
-        if not sep or not host or not ip:
-            parser.error("--map expects HOST=IP, got: %s" % entry)
-        overrides[host] = ip
+        host, sep, value = entry.partition("=")
+        if not sep or not host or not value:
+            parser.error("--map expects HOST=UPSTREAM, got: %s" % entry)
+        try:
+            overrides[host] = parse_upstream(value, default_map_port)
+        except ValueError as exc:
+            parser.error("invalid --map value %s: %s" % (entry, exc))
 
     # Configure logging
     logging_config = {
@@ -1156,7 +1257,11 @@ def main():
             except (RuntimeError, OSError) as exc:
                 logger.error("Cannot resolve upstream for %s: %s", host, exc)
                 return 1
-            logger.info("Upstream for %s -> %s:%d", host, *server.upstream[host])
+            logger.info("Upstream for %s -> %s", host, format_upstream(server.upstream[host]))
+        # A --map entry applies even if its host was not otherwise declared.
+        for host in sorted(set(overrides) - set(server.upstream)):
+            server.upstream[host] = resolve_upstream(host, args.upstream_port, overrides)
+            logger.info("Upstream for %s -> %s", host, format_upstream(server.upstream[host]))
 
         # Install the /etc/hosts redirects (or print instructions) *before*
         # announcing that we are listening: callers that wait for the "listening"
@@ -1202,6 +1307,11 @@ def main():
                 except PermissionError as exc:
                     logger.error("Failed to remove /etc/hosts redirects: %s", exc)
         return 0
+
+    # Forward mode: only --map entries override the CONNECT target.
+    server.upstream = dict(overrides)
+    for host in sorted(overrides):
+        logger.info("Upstream for %s -> %s", host, format_upstream(overrides[host]))
 
     server_thread = Thread(target=server.serve_forever)
     server_thread.daemon = True

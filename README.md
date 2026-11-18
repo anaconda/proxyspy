@@ -87,7 +87,7 @@ The tool starts a proxy server and then runs the specified command with appropri
 - `--manage-hosts`: Automatically add/remove the `/etc/hosts` redirects for declared hosts for the run's lifetime (reverse mode only; POSIX only; see below)
 - `--restore-hosts`: Remove any proxyspy-managed block from `/etc/hosts` and exit (standalone; POSIX only)
 - `--cert-dir DIR`: Directory for the persistent CA and host certificates (reverse and standalone mode default: `~/.proxyspy`)
-- `--map HOST=IP`: Pin the real upstream IP for HOST, bypassing DNS (reverse mode; can repeat)
+- `--map HOST=UPSTREAM`: Send HOST's decrypted traffic to UPSTREAM instead of its real address (forward and reverse modes; can repeat). See [Upstream Mapping](#upstream-mapping---map)
 - `--upstream-port PORT`: Port to dial on the real upstream servers in reverse mode (default: 443)
 
 ### Examples
@@ -134,6 +134,12 @@ Run the proxy standalone and drive it from a second terminal:
 proxyspy --standalone -l spy.log
 ```
 
+Put a local plain-HTTP service (e.g. `wrangler dev`) in front of a real HTTPS host, for one client only:
+
+```bash
+proxyspy --map example.com=http://127.0.0.1:8787 -- curl -s https://example.com/x
+```
+
 ## How It Works
 
 The proxy operates in two modes and can optionally add delays to any connection:
@@ -158,6 +164,29 @@ The proxy operates in two modes and can optionally add delays to any connection:
 - By default, the proxy automatically selects an available port
 - This prevents socket reuse issues and allows running multiple instances
 - A specific port can be chosen with the --port option
+
+## Upstream Mapping (`--map`)
+
+`--map HOST=UPSTREAM` sends the decrypted traffic for `HOST` somewhere other than its real address. The client still sees a normal HTTPS connection to `HOST` (proxyspy presents its MITM certificate for `HOST` as usual); only the proxy-to-server leg changes. It works in forward mode (including `--standalone`) and in reverse mode, and can be repeated for several hosts. Hosts without a `--map` entry are unaffected and still reach their real destinations.
+
+`UPSTREAM` takes one of these forms:
+
+| Value | Upstream connection |
+|---|---|
+| `IP` | TLS to `IP`; the port comes from the CONNECT request in forward mode, or `--upstream-port` in reverse mode |
+| `IP:PORT` | TLS to `IP:PORT` |
+| `https://H[:P]` | TLS to `H:P` (default port 443) |
+| `http://H[:P]` | Plain TCP to `H:P` (default port 80), no upstream TLS |
+
+TLS upstreams are always verified against the original `HOST` name (via SNI and certificate hostname checking), even when dialing a different address, so the upstream must present a certificate valid for `HOST` that the proxy process trusts. The request bytes are relayed unchanged: the `Host` header and path are not rewritten, so the upstream sees `Host: HOST`.
+
+Example: route one client's requests for `example.com` to a Cloudflare worker running under `wrangler dev`, without touching `/etc/hosts` or any other process on the machine:
+
+```bash
+proxyspy --map example.com=http://127.0.0.1:8787 -- curl -s https://example.com/x
+```
+
+In reverse mode, a `--map` value is treated as intentional and is never subjected to the loopback check, so `--map HOST=http://127.0.0.1:8787` is allowed even though `HOST` itself is redirected to proxyspy in `/etc/hosts`.
 
 ## Standalone Forward Mode
 
@@ -220,7 +249,7 @@ Workflow:
 Notes:
 
 * `--cert-dir` overrides where the persistent CA and host certificates live. Under `sudo`, the default `~/.proxyspy` resolves to the invoking user's home (via `SUDO_USER`), not root's.
-* `--map HOST=IP` pins an upstream IP, bypassing startup resolution. Use it when a host is already in `/etc/hosts`, or to target a specific backend.
+* `--map HOST=IP` pins an upstream IP, bypassing startup resolution. Use it when a host is already in `/etc/hosts`, or to target a specific backend. The other `--map` forms (`IP:PORT`, `https://…`, `http://…`) work here too; see [Upstream Mapping](#upstream-mapping---map).
 * A host listed only in `--intercept-host` (with no forwarding) never connects upstream, so it is not resolved.
 
 ### Automatic `/etc/hosts` management (opt-in)
