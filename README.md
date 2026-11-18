@@ -89,6 +89,7 @@ The tool starts a proxy server and then runs the specified command with appropri
 - `--cert-dir DIR`: Directory for the persistent CA and host certificates (reverse and standalone mode default: `~/.proxyspy`)
 - `--map HOST=UPSTREAM`: Send HOST's decrypted traffic to UPSTREAM instead of its real address (forward and reverse modes; can repeat). See [Upstream Mapping](#upstream-mapping---map)
 - `--upstream-port PORT`: Port to dial on the real upstream servers in reverse mode (default: 443)
+- `--add-header H`: Set request header H (`"Name: Value"`) on every request sent to a `--map` host (forward and reverse modes; can repeat). See [Request Header Injection](#request-header-injection---add-header)
 
 ### Examples
 
@@ -189,6 +190,25 @@ proxyspy --map example.com=http://127.0.0.1:8787 -- curl -s https://example.com/
 ```
 
 In reverse mode, a `--map` target is resolved once at startup, before any `/etc/hosts` redirects are installed, and its addresses are tried in order when connecting. So `--map api.example=https://api.example:8443` (same host, different port) reaches the real server rather than the redirect. A `--map` value is treated as intentional and is not subjected to the loopback check, so `--map HOST=http://127.0.0.1:8787` is allowed even though `HOST` itself is redirected to proxyspy in `/etc/hosts`. The one exception is a mapping that would connect back to proxyspy's own listen address (`127.0.0.1` on the listen port), for example a bare `--map HOST=127.0.0.1` with the default `--upstream-port 443`; that would loop, so proxyspy refuses to start. Mapped hosts are included in the `/etc/hosts` redirects that `--manage-hosts` writes (and in the instructions printed without it), so `sudo proxyspy --reverse --manage-hosts --map HOST=http://127.0.0.1:8787` is self-contained.
+
+## Request Header Injection (`--add-header`)
+
+A service that normally sits behind other infrastructure often expects headers that infrastructure adds — for example `CF-Connecting-IP` from Cloudflare's edge, or `X-Forwarded-For` from a load balancer. `--add-header "Name: Value"` lets you simulate them when proxyspy fronts that service with `--map`:
+
+```bash
+proxyspy --map example.com=http://127.0.0.1:8787 \
+         --add-header "CF-Connecting-IP: 203.0.113.7" \
+         --add-header "X-Forwarded-For: 203.0.113.7" \
+         -- python my_client.py
+```
+
+Behavior:
+
+* **Set semantics.** Any existing header with the same name (case-insensitive) is removed and the given one is added, so a header sent by the client is replaced, never duplicated. Repeat the option to set several headers.
+* **Mapped hosts only.** Headers are applied only to traffic for hosts with a `--map` entry, so they are never sent to unrelated real hosts. Without `--map`, `--add-header` has no effect (proxyspy logs a warning).
+* **Every request.** Clients such as `requests`/conda reuse keep-alive connections, so proxyspy frames the client's requests and rewrites each request head on the connection, not just the first. Request bodies with a `Content-Length` are forwarded untouched. The rewritten heads appear in the log.
+* **Fallback.** proxyspy does not decode request bodies. If a request uses `Transfer-Encoding` (e.g. chunked uploads), asks for a protocol upgrade (e.g. WebSocket), or its head cannot be parsed, proxyspy logs a warning and passes the rest of that connection through unmodified. The current request still gets the headers if its head was parsed; later requests on that connection do not.
+* Responses are never modified, and `Content-Length`/`Transfer-Encoding` cannot be set (they control message framing). Works in forward and reverse modes.
 
 ## Standalone Forward Mode
 
