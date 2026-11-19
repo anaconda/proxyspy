@@ -1186,7 +1186,8 @@ def _read_all(sock):
 
 def test_reverse_map_http_upstream(reverse, plain_origin):
     """Reverse mode honors an explicit http:// --map (no upstream TLS), even
-    to loopback and even when the host is not otherwise declared."""
+    to loopback. The --map entry alone is enough: a mapped host counts as
+    declared, without --prepare-host or --intercept-host."""
     reverse.start("--map", f"{MAPPED_HOST}=http://127.0.0.1:{plain_origin.port}")
     logs = reverse.logs()
     assert f"Upstream for {MAPPED_HOST} -> http://127.0.0.1:{plain_origin.port}" in logs
