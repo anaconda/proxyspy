@@ -173,6 +173,15 @@ def origin(tmp_path):
         server.stop()
 
 
+def _capture_sni(origin):
+    """Record the SNI name of each TLS connection to origin. Python sends no
+    SNI for an IP address, so this distinguishes verifying against the
+    original host name from dialing (and verifying) the mapped address."""
+    names = []
+    origin.server.socket.context.sni_callback = lambda sock, name, ctx: names.append(name)
+    return names
+
+
 @pytest.fixture
 def plain_origin(tmp_path):
     """A running in-process plain-HTTP origin; yields the LocalOrigin instance."""
@@ -902,12 +911,14 @@ def test_forward_map_http_upstream(proxy, session, origin, plain_origin):
 def test_forward_map_https_upstream(proxy, session, origin):
     """--map HOST=https://H:P dials H:P over TLS but verifies the upstream
     certificate against the original HOST name."""
+    sni_names = _capture_sni(origin)
     proxy.start_proxy(
         "--map", f"{MAPPED_HOST}=https://127.0.0.1:{origin.port}", trust=origin.cert_path
     )
 
     resp = session.get(f"https://{MAPPED_HOST}/get", timeout=10)
     assert resp.status_code == 200
+    assert sni_names == [MAPPED_HOST]
     data = resp.json()
     assert data["tls"] is True
     assert data["headers"]["Host"] == MAPPED_HOST
@@ -917,10 +928,12 @@ def test_forward_map_https_upstream(proxy, session, origin):
 
 def test_forward_map_ip_port_upstream(proxy, session, origin):
     """--map HOST=IP:PORT is TLS to that address and port."""
+    sni_names = _capture_sni(origin)
     proxy.start_proxy("--map", f"{MAPPED_HOST}=127.0.0.1:{origin.port}", trust=origin.cert_path)
 
     resp = session.get(f"https://{MAPPED_HOST}/get", timeout=10)
     assert resp.status_code == 200
+    assert sni_names == [MAPPED_HOST]
     assert resp.json()["tls"] is True
     proxy.assert_log_contains(f"Host {MAPPED_HOST} mapped to https://127.0.0.1:{origin.port}")
 
@@ -928,10 +941,12 @@ def test_forward_map_ip_port_upstream(proxy, session, origin):
 def test_forward_map_bare_ip_uses_connect_port(proxy, session, origin):
     """In forward mode a bare --map HOST=IP pins the address but keeps the
     port from the CONNECT request."""
+    sni_names = _capture_sni(origin)
     proxy.start_proxy("--map", f"{MAPPED_HOST}=127.0.0.1", trust=origin.cert_path)
 
     resp = session.get(f"https://{MAPPED_HOST}:{origin.port}/get", timeout=10)
     assert resp.status_code == 200
+    assert sni_names == [MAPPED_HOST]
     assert resp.json()["tls"] is True
     proxy.assert_log_contains(f"Host {MAPPED_HOST} mapped to https://127.0.0.1:{origin.port}")
 
@@ -969,7 +984,9 @@ def test_forward_map_invalid_value():
     ],
 )
 def test_parse_upstream(value, default_port, expected):
-    assert tuple(proxyspy.parse_upstream(value, default_port)) == expected
+    upstream = proxyspy.parse_upstream(value, default_port)
+    assert tuple(upstream[:3]) == expected
+    assert upstream.addresses is None  # only resolved later, in reverse mode
 
 
 @pytest.mark.parametrize(
@@ -1135,6 +1152,7 @@ def test_reverse_forward(reverse, origin):
     """Reverse mode forwards to the upstream, MITMing both ends. The upstream
     is pinned to the in-process origin with --map, which also exercises the
     upstream-override path and avoids any public-network dependency."""
+    sni_names = _capture_sni(origin)
     reverse.start(
         "--prepare-host",
         ORIGIN_HOST,
@@ -1163,6 +1181,8 @@ def test_reverse_forward(reverse, origin):
     logs = reverse.logs()
     assert f"SSL handshake completed (SNI: {ORIGIN_HOST})" in logs
     assert "[P<>S] SSL handshake completed" in logs
+    # The upstream is dialed by IP but verified against the original name.
+    assert sni_names == [ORIGIN_HOST]
 
 
 def test_reverse_loopback_guard(reverse):
@@ -1206,6 +1226,159 @@ def test_reverse_map_http_upstream(reverse, plain_origin):
     assert data["tls"] is False
     assert data["headers"]["Host"] == MAPPED_HOST
     assert "[P<>S] Plain TCP connection established" in reverse.logs()
+
+
+def test_reverse_map_name_resolved_at_startup(reverse, origin):
+    """A --map target given as a name is resolved at startup, before any
+    /etc/hosts redirect could send it back to us, and still verified against
+    the original host name."""
+    sni_names = _capture_sni(origin)
+    reverse.start("--map", f"{MAPPED_HOST}=https://localhost:{origin.port}", trust=origin.cert_path)
+    logs = reverse.logs()
+    assert f"Upstream for {MAPPED_HOST} -> https://localhost:{origin.port} (" in logs
+
+    sock = reverse.connect(MAPPED_HOST)
+    sock.sendall(f"GET /get HTTP/1.1\r\nHost: {MAPPED_HOST}\r\nConnection: close\r\n\r\n".encode())
+    response = _read_all(sock)
+    sock.close()
+
+    head, _, body = response.partition(b"\r\n\r\n")
+    assert b" 200 " in head.split(b"\r\n", 1)[0], head
+    assert json.loads(body)["tls"] is True
+    assert sni_names == [MAPPED_HOST]
+
+
+def test_reverse_map_refuses_self_loop(reverse):
+    """A mapping that would dial the proxy's own listen address is refused at
+    startup instead of looping. The listen port is chosen explicitly (the
+    harness's --port 0 is overridden, since argparse keeps the last value)
+    and the bare-IP map inherits it via --upstream-port, just as the default
+    --upstream-port 443 would against a proxy listening on 443."""
+    port = str(proxyspy.find_free_port())
+    reverse.start(
+        "--port",
+        port,
+        "--upstream-port",
+        port,
+        "--map",
+        f"{MAPPED_HOST}=127.0.0.1",
+        expect_exit=True,
+    )
+    assert reverse.process.returncode == 1
+    assert "would connect back to this proxy" in reverse.logs()
+
+
+def _fake_getaddrinfo(answers):
+    """getaddrinfo stand-in returning answers[name] (a list of IPs)."""
+
+    def getaddrinfo(name, port, *args, **kwargs):
+        if name not in answers:
+            raise socket.gaierror(socket.EAI_NONAME, "unknown name")
+        return [
+            (
+                socket.AF_INET6 if ":" in ip else socket.AF_INET,
+                socket.SOCK_STREAM,
+                6,
+                "",
+                (ip, port),
+            )
+            for ip in answers[name]
+        ]
+
+    return getaddrinfo
+
+
+def test_resolve_upstream_pins_mapped_name(monkeypatch):
+    """A mapped name is resolved once, to all of its addresses; a later DNS
+    change (e.g. the /etc/hosts redirect) does not affect where we dial."""
+    answers = {"api.example": ["203.0.113.5", "2001:db8::5", "203.0.113.5"]}
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo(answers))
+    overrides = {"api.example": proxyspy.parse_upstream("https://api.example:8443", 443)}
+
+    upstream = proxyspy.resolve_upstream("API.example", 443, overrides, listen=("127.0.0.1", 443))
+    assert upstream == ("https", "api.example", 8443, ("203.0.113.5", "2001:db8::5"))
+    assert "(203.0.113.5, 2001:db8::5)" in proxyspy.format_upstream(upstream)
+
+    answers["api.example"] = ["127.0.0.1"]  # now redirected to us
+    dialed = []
+
+    def fake_create_connection(address, *args, **kwargs):
+        dialed.append(address)
+        return object()
+
+    monkeypatch.setattr(socket, "create_connection", fake_create_connection)
+    proxyspy.connect_upstream(upstream)
+    assert dialed == [("203.0.113.5", 8443)]
+
+
+def test_resolve_upstream_mapped_port_defaults(monkeypatch):
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo({"10.0.0.1": ["10.0.0.1"]}))
+    overrides = {"h": proxyspy.parse_upstream("10.0.0.1", None)}
+    assert proxyspy.resolve_upstream("h", 8443, overrides) == (
+        "https",
+        "10.0.0.1",
+        8443,
+        ("10.0.0.1",),
+    )
+
+
+def test_resolve_upstream_unmapped_pins_addresses(monkeypatch):
+    monkeypatch.setattr(
+        socket, "getaddrinfo", _fake_getaddrinfo({"real.example": ["198.51.100.7"]})
+    )
+    upstream = proxyspy.resolve_upstream("real.example", 443, {})
+    assert upstream == ("https", "real.example", 443, ("198.51.100.7",))
+
+
+def test_resolve_upstream_unmapped_loopback_refused(monkeypatch):
+    """Any loopback answer for an unmapped host means it is redirected to us."""
+    monkeypatch.setattr(
+        socket, "getaddrinfo", _fake_getaddrinfo({"real.example": ["198.51.100.7", "127.0.0.1"]})
+    )
+    with pytest.raises(RuntimeError, match="loopback address"):
+        proxyspy.resolve_upstream("real.example", 443, {})
+
+
+@pytest.mark.parametrize(
+    "value, answers, refused",
+    [
+        # Literal loopback on our own listen port: refused.
+        ("127.0.0.1", {"127.0.0.1": ["127.0.0.1"]}, True),
+        # A name that already resolves to us (e.g. a manual /etc/hosts edit).
+        ("https://redirected.example", {"redirected.example": ["127.0.0.1"]}, True),
+        # A local dev server on another port is an intentional loopback map.
+        ("http://localhost:8787", {"localhost": ["::1", "127.0.0.1"]}, False),
+        # We listen on 127.0.0.1 only, so ::1 on our port is not us.
+        ("https://[::1]", {"::1": ["::1"]}, False),
+    ],
+)
+def test_resolve_upstream_self_loop_guard(monkeypatch, value, answers, refused):
+    monkeypatch.setattr(socket, "getaddrinfo", _fake_getaddrinfo(answers))
+    overrides = {"h": proxyspy.parse_upstream(value, 443)}
+    if refused:
+        with pytest.raises(RuntimeError, match="connect back to this proxy"):
+            proxyspy.resolve_upstream("h", 443, overrides, listen=("127.0.0.1", 443))
+    else:
+        proxyspy.resolve_upstream("h", 443, overrides, listen=("127.0.0.1", 443))
+
+
+def test_connect_upstream_falls_back_to_next_address():
+    """Pre-resolved addresses are tried in order, so a server listening on
+    only one of them (e.g. IPv4 127.0.0.1 when localhost is ::1 first) is
+    still reached, as socket.create_connection() would for a name."""
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        upstream = proxyspy.Upstream("http", "localhost", port, ("::1", "127.0.0.1"))
+        with proxyspy.connect_upstream(upstream) as conn:
+            assert conn.getpeername()[:2] == ("127.0.0.1", port)
+
+
+def test_connect_upstream_raises_when_all_fail():
+    port = proxyspy.find_free_port()
+    with pytest.raises(OSError):
+        proxyspy.connect_upstream(proxyspy.Upstream("http", "x", port, ("127.0.0.1",)))
 
 
 #

@@ -253,8 +253,11 @@ def read_or_create_cert(host=None):
 # Where a tunnel's decrypted traffic is sent. scheme is "https" (wrap the
 # upstream socket in TLS, verified against the original host name) or "http"
 # (plain TCP, no upstream TLS). port may be None for a bare --map HOST=IP
-# value in forward mode, meaning "use the CONNECT port".
-Upstream = namedtuple("Upstream", "scheme address port")
+# value in forward mode, meaning "use the CONNECT port". addresses, if set,
+# is the tuple of IPs that address resolved to at startup (reverse mode);
+# they are dialed in order instead of resolving address again when a
+# connection arrives, by which time /etc/hosts may redirect it to us.
+Upstream = namedtuple("Upstream", "scheme address port addresses", defaults=(None,))
 
 DEFAULT_PORTS = {"https": 443, "http": 80}
 
@@ -306,9 +309,30 @@ def parse_upstream(value, default_port=None):
 
 
 def format_upstream(upstream):
-    """Human-readable form of an Upstream for log messages."""
+    """Human-readable form of an Upstream for log messages, including the
+    pre-resolved addresses when they differ from the address itself."""
     port = "<connect port>" if upstream.port is None else upstream.port
-    return "%s://%s:%s" % (upstream.scheme, upstream.address, port)
+    text = "%s://%s:%s" % (upstream.scheme, upstream.address, port)
+    if upstream.addresses and upstream.addresses != (upstream.address,):
+        text += " (%s)" % ", ".join(upstream.addresses)
+    return text
+
+
+def connect_upstream(upstream):
+    """Open a TCP connection to upstream. Pre-resolved addresses are tried
+    in order, like socket.create_connection() does for a name, so a server
+    listening on only one address family is still reached; otherwise the
+    address is resolved now. Raises the last connection error if every
+    address fails."""
+    if not upstream.addresses:
+        return socket.create_connection((upstream.address, upstream.port))
+    error = None
+    for ip in upstream.addresses:
+        try:
+            return socket.create_connection((ip, upstream.port))
+        except OSError as exc:
+            error = exc
+    raise error
 
 
 class MyHTTPServer(ThreadingHTTPServer):
@@ -449,9 +473,8 @@ class ConnLoggingMixin:
         else:
             remote = None
             try:
-                address = (upstream.address, upstream.port)
-                self._log("About to create %s connection to %s:%d", upstream.scheme, *address)
-                remote = socket.create_connection(address)
+                self._log("About to create connection to %s", format_upstream(upstream))
+                remote = connect_upstream(upstream)
                 if upstream.scheme == "http":
                     self._log("[P<>S] Plain TCP connection established (no upstream TLS)")
                 else:
@@ -664,21 +687,44 @@ def make_sni_context():
     return base
 
 
-def resolve_upstream(host, port, overrides):
-    """Resolve host to a real Upstream, preferring --map overrides (a dict of
-    host -> Upstream). Refuses a loopback result unless mapped, since that
-    means the host is already redirected to us in /etc/hosts and forwarding
-    would loop back. A --map value is explicit, so it is never checked."""
+def _resolve_addresses(name, port):
+    """All distinct IPs name resolves to, in resolver order."""
+    infos = socket.getaddrinfo(name, port, type=socket.SOCK_STREAM)
+    return tuple(dict.fromkeys(info[4][0] for info in infos))
+
+
+def resolve_upstream(host, port, overrides, listen=None):
+    """Resolve host to an Upstream with its addresses pinned, preferring
+    --map overrides (a dict of host -> Upstream).
+
+    Runs at reverse-mode startup, before /etc/hosts redirects are installed,
+    so later lookups (which may return our own loopback address) are never
+    needed. A mapped upstream's address is resolved too: it may be HOST
+    itself on another port, or another redirected host.
+
+    An unmapped host that resolves to loopback is refused, since it is
+    already redirected to us in /etc/hosts. A --map value is explicit, so a
+    loopback mapping (e.g. a local dev server) is allowed, unless it would
+    dial listen, the proxy's own (address, port), and loop back into it."""
     if host.lower() in overrides:
         upstream = overrides[host.lower()]
-        return upstream if upstream.port is not None else upstream._replace(port=port)
-    ip = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)[0][4][0]
-    if ipaddress.ip_address(ip).is_loopback:
+        if upstream.port is None:
+            upstream = upstream._replace(port=port)
+        addresses = _resolve_addresses(upstream.address, upstream.port)
+        if listen is not None and upstream.port == listen[1] and listen[0] in addresses:
+            raise RuntimeError(
+                "--map %s=%s would connect back to this proxy on %s:%d"
+                % (host, format_upstream(upstream), listen[0], listen[1])
+            )
+        return upstream._replace(addresses=addresses)
+    addresses = _resolve_addresses(host, port)
+    loopback = [ip for ip in addresses if ipaddress.ip_address(ip.split("%")[0]).is_loopback]
+    if loopback:
         raise RuntimeError(
             "%s already resolves to a loopback address (%s); remove it from "
-            "/etc/hosts before starting, or pin it with --map %s=<ip>" % (host, ip, host)
+            "/etc/hosts before starting, or pin it with --map %s=<ip>" % (host, loopback[0], host)
         )
-    return Upstream("https", ip, port)
+    return Upstream("https", host, port, addresses)
 
 
 def _sudo_pw():
@@ -1260,7 +1306,7 @@ def main():
                 continue
             try:
                 server.upstream[host.lower()] = resolve_upstream(
-                    host, args.upstream_port, overrides
+                    host, args.upstream_port, overrides, listen=server.server_address
                 )
             except (RuntimeError, OSError) as exc:
                 logger.error("Cannot resolve upstream for %s: %s", host, exc)

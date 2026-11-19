@@ -188,7 +188,7 @@ Example: route one client's requests for `example.com` to a Cloudflare worker ru
 proxyspy --map example.com=http://127.0.0.1:8787 -- curl -s https://example.com/x
 ```
 
-In reverse mode, a `--map` value is treated as intentional and is never subjected to the loopback check, so `--map HOST=http://127.0.0.1:8787` is allowed even though `HOST` itself is redirected to proxyspy in `/etc/hosts`. Mapped hosts are included in the `/etc/hosts` redirects that `--manage-hosts` writes (and in the instructions printed without it), so `sudo proxyspy --reverse --manage-hosts --map HOST=http://127.0.0.1:8787` is self-contained.
+In reverse mode, a `--map` target is resolved once at startup, before any `/etc/hosts` redirects are installed, and its addresses are tried in order when connecting. So `--map api.example=https://api.example:8443` (same host, different port) reaches the real server rather than the redirect. A `--map` value is treated as intentional and is not subjected to the loopback check, so `--map HOST=http://127.0.0.1:8787` is allowed even though `HOST` itself is redirected to proxyspy in `/etc/hosts`. The one exception is a mapping that would connect back to proxyspy's own listen address (`127.0.0.1` on the listen port), for example a bare `--map HOST=127.0.0.1` with the default `--upstream-port 443`; that would loop, so proxyspy refuses to start. Mapped hosts are included in the `/etc/hosts` redirects that `--manage-hosts` writes (and in the instructions printed without it), so `sudo proxyspy --reverse --manage-hosts --map HOST=http://127.0.0.1:8787` is self-contained.
 
 ## Standalone Forward Mode
 
@@ -232,7 +232,7 @@ Notes:
 
 This matters because forward mode works by setting `HTTPS_PROXY`, so it can only exercise a client's *proxied* code path. Some clients behave differently with and without a proxy configured, so the proxied path is not a faithful stand-in for a user behind a transparent intercepting firewall. For example, in [conda/conda#16253](https://github.com/conda/conda/pull/16253) `requests` applied a `truststore` SSL context on its direct-connection path but dropped it on the separate proxy path, so verification against a MITM firewall's certificate silently failed *only* under a proxy. Reverse mode lets proxyspy intercept the TLS handshake while the client still takes its direct, no-proxy path, making that class of difference reproducible. The two modes are complementary test surfaces.
 
-Because `/etc/hosts` redirects the target hostnames to proxyspy itself, proxyspy cannot use the OS resolver to reach the real upstream once those entries are in place. It therefore resolves and caches each declared host's real IP **at startup** — so you must start proxyspy *before* editing `/etc/hosts`. If a declared host already resolves to a loopback address, proxyspy refuses to start and tells you to remove it from `/etc/hosts` or pin it with `--map HOST=IP`.
+Because `/etc/hosts` redirects the target hostnames to proxyspy itself, proxyspy cannot use the OS resolver to reach the real upstream once those entries are in place. It therefore resolves and caches each declared host's real addresses (and each `--map` target's) **at startup** — so you must start proxyspy *before* editing `/etc/hosts`. If a declared host already resolves to a loopback address, proxyspy refuses to start and tells you to remove it from `/etc/hosts` or pin it with `--map HOST=IP`.
 
 Workflow:
 
