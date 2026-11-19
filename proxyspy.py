@@ -331,8 +331,9 @@ class MyHTTPServer(ThreadingHTTPServer):
         self.return_headers = []  # List of (name, value) tuples
         self.return_data = ""  # Response body
         self.delay = 0
-        # host -> Upstream overrides. Forward mode holds only --map entries;
-        # reverse mode also holds the declared hosts resolved at startup.
+        # host -> Upstream overrides, keyed by lowercase host name. Forward
+        # mode holds only --map entries; reverse mode also holds the declared
+        # hosts resolved at startup.
         self.upstream = {}
         # Reverse mode only: the SNI-dispatching server context
         self.base_context = None
@@ -562,7 +563,7 @@ class ProxyHandler(ConnLoggingMixin, BaseHTTPRequestHandler):
             # A --map override redirects this host's decrypted traffic; a bare
             # HOST=IP override inherits the CONNECT port. Unmapped hosts go to
             # the CONNECT target, resolved normally.
-            upstream = self.server.upstream.get(host)
+            upstream = self.server.upstream.get(host.lower())
             if upstream is None:
                 upstream = Upstream("https", host, int(port))
             else:
@@ -613,7 +614,7 @@ class ReverseHandler(ConnLoggingMixin, socketserver.BaseRequestHandler):
                 self._log("No SNI hostname provided by client; closing", level="error")
                 return
 
-            upstream = self.server.upstream.get(host)
+            upstream = self.server.upstream.get(host.lower())
             if upstream is None:
                 # Not a declared or mapped host: fall back to resolving the SNI
                 # name. This only succeeds if it is not redirected to us in
@@ -668,8 +669,8 @@ def resolve_upstream(host, port, overrides):
     host -> Upstream). Refuses a loopback result unless mapped, since that
     means the host is already redirected to us in /etc/hosts and forwarding
     would loop back. A --map value is explicit, so it is never checked."""
-    if host in overrides:
-        upstream = overrides[host]
+    if host.lower() in overrides:
+        upstream = overrides[host.lower()]
         return upstream if upstream.port is not None else upstream._replace(port=port)
     ip = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)[0][4][0]
     if ipaddress.ip_address(ip).is_loopback:
@@ -1156,7 +1157,8 @@ def main():
         if not sep or not host or not value:
             parser.error("--map expects HOST=UPSTREAM, got: %s" % entry)
         try:
-            overrides[host] = parse_upstream(value, default_map_port)
+            # Host names are case-insensitive; clients send them lowercase.
+            overrides[host.lower()] = parse_upstream(value, default_map_port)
         except ValueError as exc:
             parser.error("invalid --map value %s: %s" % (entry, exc))
 
@@ -1206,7 +1208,11 @@ def main():
         atexit.register(cleanup)
     logger.info("Certificate directory: %s", CERT_DIR)
     cert_path, key_path = read_or_create_cert()
-    declared_hosts = set(args.intercept_host or ()) | set(args.prepare_host or ())
+    # A --map host is one we intend to intercept, so it counts as declared:
+    # its certificate is pre-generated and, in reverse mode, it is resolved
+    # (to its mapping), listed in the /etc/hosts instructions and written by
+    # --manage-hosts.
+    declared_hosts = set(args.intercept_host or ()) | set(args.prepare_host or ()) | set(overrides)
     for host in declared_hosts:
         read_or_create_cert(host)
 
@@ -1253,15 +1259,15 @@ def main():
             if intercept_all or host in server.intercept_hosts:
                 continue
             try:
-                server.upstream[host] = resolve_upstream(host, args.upstream_port, overrides)
+                server.upstream[host.lower()] = resolve_upstream(
+                    host, args.upstream_port, overrides
+                )
             except (RuntimeError, OSError) as exc:
                 logger.error("Cannot resolve upstream for %s: %s", host, exc)
                 return 1
-            logger.info("Upstream for %s -> %s", host, format_upstream(server.upstream[host]))
-        # A --map entry applies even if its host was not otherwise declared.
-        for host in sorted(set(overrides) - set(server.upstream)):
-            server.upstream[host] = resolve_upstream(host, args.upstream_port, overrides)
-            logger.info("Upstream for %s -> %s", host, format_upstream(server.upstream[host]))
+            logger.info(
+                "Upstream for %s -> %s", host, format_upstream(server.upstream[host.lower()])
+            )
 
         # Install the /etc/hosts redirects (or print instructions) *before*
         # announcing that we are listening: callers that wait for the "listening"

@@ -169,6 +169,8 @@ The proxy operates in two modes and can optionally add delays to any connection:
 
 `--map HOST=UPSTREAM` sends the decrypted traffic for `HOST` somewhere other than its real address. The client still sees a normal HTTPS connection to `HOST` (proxyspy presents its MITM certificate for `HOST` as usual); only the proxy-to-server leg changes. It works in forward mode (including `--standalone`) and in reverse mode, and can be repeated for several hosts. Hosts without a `--map` entry are unaffected and still reach their real destinations.
 
+A mapping matches on host name only (case-insensitively), so it applies to every port the client connects to on that host; with an `IP`-only value in forward mode, that port is carried through to the upstream. A mapped host also counts as declared, like `--prepare-host`: its certificate is generated at startup.
+
 `UPSTREAM` takes one of these forms:
 
 | Value | Upstream connection |
@@ -186,7 +188,7 @@ Example: route one client's requests for `example.com` to a Cloudflare worker ru
 proxyspy --map example.com=http://127.0.0.1:8787 -- curl -s https://example.com/x
 ```
 
-In reverse mode, a `--map` value is treated as intentional and is never subjected to the loopback check, so `--map HOST=http://127.0.0.1:8787` is allowed even though `HOST` itself is redirected to proxyspy in `/etc/hosts`.
+In reverse mode, a `--map` value is treated as intentional and is never subjected to the loopback check, so `--map HOST=http://127.0.0.1:8787` is allowed even though `HOST` itself is redirected to proxyspy in `/etc/hosts`. Mapped hosts are included in the `/etc/hosts` redirects that `--manage-hosts` writes (and in the instructions printed without it), so `sudo proxyspy --reverse --manage-hosts --map HOST=http://127.0.0.1:8787` is self-contained.
 
 ## Standalone Forward Mode
 
@@ -251,6 +253,7 @@ Notes:
 * `--cert-dir` overrides where the persistent CA and host certificates live. Under `sudo`, the default `~/.proxyspy` resolves to the invoking user's home (via `SUDO_USER`), not root's.
 * `--map HOST=IP` pins an upstream IP, bypassing startup resolution. Use it when a host is already in `/etc/hosts`, or to target a specific backend. The other `--map` forms (`IP:PORT`, `https://…`, `http://…`) work here too; see [Upstream Mapping](#upstream-mapping---map).
 * A host listed only in `--intercept-host` (with no forwarding) never connects upstream, so it is not resolved.
+* A `--map` host counts as declared, so `--manage-hosts` redirects it without also needing `--prepare-host`.
 
 ### Automatic `/etc/hosts` management (opt-in)
 

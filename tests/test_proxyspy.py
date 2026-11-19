@@ -936,6 +936,16 @@ def test_forward_map_bare_ip_uses_connect_port(proxy, session, origin):
     proxy.assert_log_contains(f"Host {MAPPED_HOST} mapped to https://127.0.0.1:{origin.port}")
 
 
+def test_forward_map_host_is_case_insensitive(proxy, session, plain_origin):
+    """--map host keys match regardless of case; clients send lowercase."""
+    proxy.start_proxy("--map", f"{MAPPED_HOST.upper()}=http://127.0.0.1:{plain_origin.port}")
+
+    resp = session.get(f"https://{MAPPED_HOST}/get", timeout=10)
+    assert resp.status_code == 200
+    assert resp.json()["tls"] is False
+    proxy.assert_log_contains(f"Host {MAPPED_HOST} mapped to http://127.0.0.1:{plain_origin.port}")
+
+
 def test_forward_map_invalid_value():
     result = _run_proxyspy_cli("--map", f"{MAPPED_HOST}=ftp://127.0.0.1", "--", "echo", "hi")
     assert result.returncode == 2
@@ -1178,7 +1188,11 @@ def test_reverse_map_http_upstream(reverse, plain_origin):
     """Reverse mode honors an explicit http:// --map (no upstream TLS), even
     to loopback and even when the host is not otherwise declared."""
     reverse.start("--map", f"{MAPPED_HOST}=http://127.0.0.1:{plain_origin.port}")
-    assert f"Upstream for {MAPPED_HOST} -> http://127.0.0.1:{plain_origin.port}" in reverse.logs()
+    logs = reverse.logs()
+    assert f"Upstream for {MAPPED_HOST} -> http://127.0.0.1:{plain_origin.port}" in logs
+    # A mapped host counts as declared: cert pre-generated, redirect listed.
+    assert f"Requested certificate for {MAPPED_HOST}" in logs
+    assert f"Redirect these hosts to 127.0.0.1 in /etc/hosts: {MAPPED_HOST}" in logs
 
     sock = reverse.connect(MAPPED_HOST)
     sock.sendall(f"GET /get HTTP/1.1\r\nHost: {MAPPED_HOST}\r\nConnection: close\r\n\r\n".encode())
@@ -1904,6 +1918,20 @@ class TestManageHostsIntegration:
             response = sock.recv(4096)
             sock.close()
             assert b"418" in response
+        finally:
+            harness.stop()
+
+        assert Path(proxyspy.HOSTS_PATH).read_text() == original
+
+    def test_map_host_is_managed(self, tmp_path):
+        """A --map host alone is enough for --manage-hosts to redirect it."""
+        original = Path(proxyspy.HOSTS_PATH).read_text()
+        harness = ReverseHarness(tmp_path)
+        try:
+            # The mapping is never dialed; an explicit map skips resolution, so
+            # the unresolvable .invalid host is fine.
+            harness.start("--manage-hosts", "--map", f"{self.HOST}=http://127.0.0.1:9")
+            assert f"127.0.0.1 {self.HOST}" in Path(proxyspy.HOSTS_PATH).read_text()
         finally:
             harness.stop()
 
