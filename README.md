@@ -87,7 +87,7 @@ The tool starts a proxy server and then runs the specified command with appropri
 - `--manage-hosts`: Automatically add/remove the `/etc/hosts` redirects for declared hosts for the run's lifetime (reverse mode only; POSIX only; see below)
 - `--restore-hosts`: Remove any proxyspy-managed block from `/etc/hosts` and exit (standalone; POSIX only)
 - `--cert-dir DIR`: Directory for the persistent CA and host certificates (reverse and standalone mode default: `~/.proxyspy`)
-- `--map HOST=IP`: Pin the real upstream IP for HOST, bypassing DNS (reverse mode; can repeat)
+- `--map HOST=UPSTREAM`: Send HOST's decrypted traffic to UPSTREAM instead of its real address (forward and reverse modes; can repeat). See [Upstream Mapping](#upstream-mapping---map)
 - `--upstream-port PORT`: Port to dial on the real upstream servers in reverse mode (default: 443)
 
 ### Examples
@@ -134,6 +134,12 @@ Run the proxy standalone and drive it from a second terminal:
 proxyspy --standalone -l spy.log
 ```
 
+Put a local plain-HTTP service (e.g. `wrangler dev`) in front of a real HTTPS host, for one client only:
+
+```bash
+proxyspy --map example.com=http://127.0.0.1:8787 -- curl -s https://example.com/x
+```
+
 ## How It Works
 
 The proxy operates in two modes and can optionally add delays to any connection:
@@ -158,6 +164,31 @@ The proxy operates in two modes and can optionally add delays to any connection:
 - By default, the proxy automatically selects an available port
 - This prevents socket reuse issues and allows running multiple instances
 - A specific port can be chosen with the --port option
+
+## Upstream Mapping (`--map`)
+
+`--map HOST=UPSTREAM` sends the decrypted traffic for `HOST` somewhere other than its real address. The client still sees a normal HTTPS connection to `HOST` (proxyspy presents its MITM certificate for `HOST` as usual); only the proxy-to-server leg changes. It works in forward mode (including `--standalone`) and in reverse mode, and can be repeated for several hosts. Hosts without a `--map` entry are unaffected and still reach their real destinations.
+
+A mapping matches on host name only (case-insensitively), so it applies to every port the client connects to on that host; with an `IP`-only value in forward mode, that port is carried through to the upstream. A mapped host also counts as declared, like `--prepare-host`: its certificate is generated at startup.
+
+`UPSTREAM` takes one of these forms:
+
+| Value | Upstream connection |
+|---|---|
+| `IP` | TLS to `IP`; the port comes from the CONNECT request in forward mode, or `--upstream-port` in reverse mode |
+| `IP:PORT` | TLS to `IP:PORT` |
+| `https://H[:P]` | TLS to `H:P` (default port 443) |
+| `http://H[:P]` | Plain TCP to `H:P` (default port 80), no upstream TLS |
+
+TLS upstreams are always verified against the original `HOST` name (via SNI and certificate hostname checking), even when dialing a different address, so the upstream must present a certificate valid for `HOST` that the proxy process trusts. The request bytes are relayed unchanged: the `Host` header and path are not rewritten, so the upstream sees `Host: HOST`.
+
+Example: route one client's requests for `example.com` to a Cloudflare worker running under `wrangler dev`, without touching `/etc/hosts` or any other process on the machine:
+
+```bash
+proxyspy --map example.com=http://127.0.0.1:8787 -- curl -s https://example.com/x
+```
+
+In reverse mode, a `--map` target is resolved once at startup, before any `/etc/hosts` redirects are installed, and its addresses are tried in order when connecting. So `--map api.example=https://api.example:8443` (same host, different port) reaches the real server rather than the redirect. A `--map` value is treated as intentional and is not subjected to the loopback check, so `--map HOST=http://127.0.0.1:8787` is allowed even though `HOST` itself is redirected to proxyspy in `/etc/hosts`. The one exception is a mapping that would connect back to proxyspy's own listen address (`127.0.0.1` on the listen port), for example a bare `--map HOST=127.0.0.1` with the default `--upstream-port 443`; that would loop, so proxyspy refuses to start. Mapped hosts are included in the `/etc/hosts` redirects that `--manage-hosts` writes (and in the instructions printed without it), so `sudo proxyspy --reverse --manage-hosts --map HOST=http://127.0.0.1:8787` is self-contained.
 
 ## Standalone Forward Mode
 
@@ -201,7 +232,7 @@ Notes:
 
 This matters because forward mode works by setting `HTTPS_PROXY`, so it can only exercise a client's *proxied* code path. Some clients behave differently with and without a proxy configured, so the proxied path is not a faithful stand-in for a user behind a transparent intercepting firewall. For example, in [conda/conda#16253](https://github.com/conda/conda/pull/16253) `requests` applied a `truststore` SSL context on its direct-connection path but dropped it on the separate proxy path, so verification against a MITM firewall's certificate silently failed *only* under a proxy. Reverse mode lets proxyspy intercept the TLS handshake while the client still takes its direct, no-proxy path, making that class of difference reproducible. The two modes are complementary test surfaces.
 
-Because `/etc/hosts` redirects the target hostnames to proxyspy itself, proxyspy cannot use the OS resolver to reach the real upstream once those entries are in place. It therefore resolves and caches each declared host's real IP **at startup** — so you must start proxyspy *before* editing `/etc/hosts`. If a declared host already resolves to a loopback address, proxyspy refuses to start and tells you to remove it from `/etc/hosts` or pin it with `--map HOST=IP`.
+Because `/etc/hosts` redirects the target hostnames to proxyspy itself, proxyspy cannot use the OS resolver to reach the real upstream once those entries are in place. It therefore resolves and caches each declared host's real addresses (and each `--map` target's) **at startup** — so you must start proxyspy *before* editing `/etc/hosts`. If a declared host already resolves to a loopback address, proxyspy refuses to start and tells you to remove it from `/etc/hosts` or pin it with `--map HOST=IP`.
 
 Workflow:
 
@@ -220,8 +251,9 @@ Workflow:
 Notes:
 
 * `--cert-dir` overrides where the persistent CA and host certificates live. Under `sudo`, the default `~/.proxyspy` resolves to the invoking user's home (via `SUDO_USER`), not root's.
-* `--map HOST=IP` pins an upstream IP, bypassing startup resolution. Use it when a host is already in `/etc/hosts`, or to target a specific backend.
+* `--map HOST=IP` pins an upstream IP, bypassing startup resolution. Use it when a host is already in `/etc/hosts`, or to target a specific backend. The other `--map` forms (`IP:PORT`, `https://…`, `http://…`) work here too; see [Upstream Mapping](#upstream-mapping---map).
 * A host listed only in `--intercept-host` (with no forwarding) never connects upstream, so it is not resolved.
+* A `--map` host counts as declared, so `--manage-hosts` redirects it without also needing `--prepare-host`.
 
 ### Automatic `/etc/hosts` management (opt-in)
 
