@@ -44,6 +44,7 @@ Arguments:
     --map HOST=UPSTREAM   Send HOST's traffic to UPSTREAM instead (can repeat);
                           UPSTREAM is IP, IP:PORT, https://H[:P] or http://H[:P]
     --upstream-port PORT  Upstream port to dial in reverse mode (default: 443)
+    --add-header H        Set request header H on --map hosts' traffic (can repeat)
 
 Examples:
     # Log all HTTPS requests to test.log:
@@ -61,6 +62,12 @@ Examples:
     # Put a local plain-HTTP service in front of a real HTTPS host for one
     # client; other hosts are tunneled to their real destinations:
     ./proxyspy.py --map example.com=http://127.0.0.1:8787 -- curl https://example.com/x
+
+    # ...and simulate a header normally injected by the infrastructure in front
+    # of that service, on every request to the mapped host:
+    ./proxyspy.py --map example.com=http://127.0.0.1:8787 \\
+                  --add-header "CF-Connecting-IP: 203.0.113.7" \\
+                  -- curl https://example.com/x
 
     # Standalone forward proxy; set the printed vars in another shell:
     ./proxyspy.py --standalone -l spy.log
@@ -102,7 +109,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 # Modified by our pre-commit hook
-__version__ = "0.2.0.post4"
+__version__ = "0.2.0.post5"
 
 # _forward_data buffer size
 BUFFER_SIZE = 65536
@@ -335,6 +342,154 @@ def connect_upstream(upstream):
     raise error
 
 
+# Largest request head (request line + headers) RequestFramer will buffer
+# while looking for the terminating blank line before giving up.
+MAX_REQUEST_HEAD = 65536
+
+# A blank line ending a request head: CRLFCRLF, or a bare-LF variant (which
+# RequestFramer detects only in order to fall back to passthrough).
+_BLANK_LINE_RE = re.compile(rb"\r?\n\r?\n")
+
+# RFC 9110 section 5.6.2 "token": the allowed characters of a header name.
+_TOKEN_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+
+# --add-header may not set these: they determine message framing, so changing
+# them would desynchronize the framer from what the upstream server parses.
+FRAMING_HEADERS = frozenset(("content-length", "transfer-encoding"))
+
+
+class RequestFramer:
+    """Minimal client->server HTTP/1.x request framer that *sets* headers on
+    every request of a (possibly keep-alive) connection.
+
+    Feed it decrypted client bytes as they arrive; it buffers until a full
+    request head (terminated by CRLFCRLF) is available, rewrites the head
+    (dropping any existing header of the same name, case-insensitively, then
+    appending the configured ones), then passes exactly Content-Length body
+    bytes (0 if absent) through untouched before parsing the next head.
+
+    It does not decode bodies. If a request uses Transfer-Encoding (e.g.
+    chunked), asks for a protocol upgrade, or the head cannot be parsed, it
+    reports a warning and passes the rest of the connection through
+    unmodified. (A chunked or upgrade request's own head is still rewritten.)
+
+    feed() returns a list of (kind, payload) events in stream order:
+      ("head", bytes)  a rewritten request head, to log and send
+      ("data", bytes)  body or passthrough bytes, to send
+      ("warn", str)    a message to log
+    """
+
+    def __init__(self, headers):
+        self.headers = list(headers)
+        self._names = {name.lower() for name, _ in self.headers}
+        self._buffer = b""
+        self._body_remaining = 0
+        self.raw = False
+
+    def feed(self, data):
+        events = []
+        if self.raw:
+            if data:
+                events.append(("data", data))
+            return events
+        self._buffer += data
+        while self._buffer:
+            if self._body_remaining:
+                chunk = self._buffer[: self._body_remaining]
+                self._buffer = self._buffer[len(chunk) :]  # noqa
+                self._body_remaining -= len(chunk)
+                events.append(("data", chunk))
+                continue
+            if self._buffer.startswith(b"\r\n"):
+                # Tolerate stray CRLFs between requests (RFC 9112 2.2)
+                self._buffer = self._buffer[2:]
+                events.append(("data", b"\r\n"))
+                continue
+            # The first blank line ends the head. Find it whether it is CRLF or
+            # bare-LF, so a non-conforming bare-LF client falls back to
+            # passthrough instead of stalling until the idle timeout.
+            match = _BLANK_LINE_RE.search(self._buffer)
+            # Apply the size limit to the completed head when we have one (not
+            # counting a body or later request in the same buffer), otherwise
+            # to what is buffered so far, so the outcome does not depend on
+            # where read boundaries fall.
+            head_length = match.end() if match is not None else len(self._buffer)
+            if head_length > MAX_REQUEST_HEAD:
+                self._go_raw(events, "request head exceeds %d bytes" % MAX_REQUEST_HEAD)
+                break
+            if match is None:
+                break
+            if match.group() != b"\r\n\r\n":
+                self._go_raw(events, "request head uses bare LF line endings")
+                break
+            head = self._buffer[: match.end()]
+            self._buffer = self._buffer[match.end() :]  # noqa
+            try:
+                new_head, body_length, passthrough = self._rewrite(head)
+            except ValueError as exc:
+                events.append(("data", head))
+                self._go_raw(events, "unparseable request head (%s)" % exc)
+                break
+            events.append(("head", new_head))
+            if passthrough:
+                self._go_raw(events, passthrough)
+                break
+            self._body_remaining = body_length
+        return events
+
+    def _go_raw(self, events, reason):
+        events.append(
+            ("warn", "%s; passing the rest of this connection through unmodified" % reason)
+        )
+        self.raw = True
+        if self._buffer:
+            events.append(("data", self._buffer))
+            self._buffer = b""
+
+    def _rewrite(self, head):
+        """Return (new_head, body_length, passthrough_reason) for one request
+        head, or raise ValueError if it is not a parseable HTTP/1.x head."""
+        lines = head[:-4].decode("iso-8859-1").split("\r\n")
+        if any("\r" in line or "\n" in line for line in lines):
+            raise ValueError("bare CR or LF in request head")
+        request_line = lines[0]
+        parts = request_line.split(" ")
+        if len(parts) != 3 or not parts[0] or not parts[2].startswith("HTTP/1."):
+            raise ValueError("bad request line %r" % request_line[:80])
+        kept = []
+        values = {}
+        for line in lines[1:]:
+            name, sep, value = line.partition(":")
+            # Reject obsolete line folding and whitespace before the colon
+            if not sep or not name or name != name.strip() or line[0] in " \t":
+                raise ValueError("bad header line %r" % line[:80])
+            lname = name.lower()
+            values.setdefault(lname, []).append(value.strip())
+            if lname not in self._names:
+                kept.append(line)
+        kept.extend("%s: %s" % header for header in self.headers)
+        new_head = "\r\n".join([request_line] + kept) + "\r\n\r\n"
+        new_head = new_head.encode("iso-8859-1")
+
+        if "transfer-encoding" in values:
+            reason = "request uses Transfer-Encoding: %s" % ", ".join(values["transfer-encoding"])
+            return new_head, 0, reason
+        # A configured Upgrade header is in new_head but not in values; the
+        # server may switch protocols either way.
+        if "upgrade" in values or "upgrade" in self._names or parts[0].upper() == "CONNECT":
+            return new_head, 0, "request switches protocols"
+        lengths = set(values.get("content-length", ()))
+        if len(lengths) > 1:
+            raise ValueError("conflicting Content-Length values")
+        body_length = 0
+        if lengths:
+            length = lengths.pop()
+            if not length.isdigit():
+                raise ValueError("bad Content-Length %r" % length)
+            body_length = int(length)
+        return new_head, body_length, None
+
+
 class MyHTTPServer(ThreadingHTTPServer):
     """Thread-per-connection server, used for both the forward (ProxyHandler)
     and reverse (ReverseHandler) modes; the handler decides how to read the
@@ -359,6 +514,10 @@ class MyHTTPServer(ThreadingHTTPServer):
         # mode holds only --map entries; reverse mode also holds the declared
         # hosts resolved at startup.
         self.upstream = {}
+        # --add-header: (name, value) request headers to set, and the hosts
+        # (those with a --map entry) whose traffic they apply to
+        self.add_headers = []
+        self.add_header_hosts = set()
         # Reverse mode only: the SNI-dispatching server context
         self.base_context = None
 
@@ -484,14 +643,27 @@ class ConnLoggingMixin:
                     server_context = ssl.create_default_context()
                     remote = server_context.wrap_socket(remote, server_hostname=host)
                     self._log("[P<>S] SSL handshake completed")
+                # Only frame/rewrite requests for hosts that need it; everything
+                # else uses the plain byte relay.
+                framer = None
+                if self.server.add_headers and host.lower() in self.server.add_header_hosts:
+                    self._log(
+                        "Setting %d request header(s) on every request to %s",
+                        len(self.server.add_headers),
+                        host,
+                    )
+                    framer = RequestFramer(self.server.add_headers)
                 # Forward all requests to the real server
-                self._forward_data(client, remote)
+                self._forward_data(client, remote, framer)
             finally:
                 if remote:
                     remote.close()
 
-    def _forward_data(self, client, remote):
-        """Forward data between client and remote, logging headers and tracking binary data size"""
+    def _forward_data(self, client, remote, framer=None):
+        """Forward data between client and remote, logging headers and tracking
+        binary data size. If framer (a RequestFramer) is given, client->server
+        bytes are passed through it so every request head can be rewritten and
+        logged; the server->client direction is always relayed as-is."""
 
         def forward(source, destination, direction, bcount, is_binary):
             try:
@@ -502,7 +674,21 @@ class ConnLoggingMixin:
                 self._log("%s: Receive error: %s", direction, exc, level="error")
                 return False, bcount, is_binary
 
-            if is_binary:
+            if framer is not None and source is client:
+                out = []
+                for kind, payload in framer.feed(data):
+                    if kind == "head":
+                        self._multiline_log(payload, direction=direction)
+                        out.append(payload)
+                    elif kind == "data":
+                        bcount += len(payload)
+                        out.append(payload)
+                    else:
+                        self._log("[%s] %s", direction, payload, level="warning")
+                data = b"".join(out)
+                if not data:
+                    return True, bcount, is_binary
+            elif is_binary:
                 bcount += len(data)
             else:
                 # First chunk contains headers; subsequent chunks may be binary
@@ -1122,6 +1308,15 @@ def main():
         "127.0.0.1 in /etc/hosts.",
     )
     parser.add_argument(
+        "--add-header",
+        action="append",
+        metavar="HEADER",
+        help='Request header in format "Name: Value" to set on every request sent to a '
+        "host that has a --map entry (forward and reverse modes; can be repeated). Any "
+        "existing header of the same name (case-insensitive) is replaced. Requests to "
+        "unmapped hosts are never modified.",
+    )
+    parser.add_argument(
         "--upstream-port",
         type=int,
         default=443,
@@ -1208,6 +1403,30 @@ def main():
         except ValueError as exc:
             parser.error("invalid --map value %s: %s" % (entry, exc))
 
+    # Parse --add-header "Name: Value" request headers
+    add_headers = []
+    for entry in args.add_header or []:
+        name, sep, value = entry.partition(":")
+        name, value = name.strip(), value.strip()
+        if not sep or not name:
+            parser.error('--add-header expects "Name: Value", got: %s' % entry)
+        if not _TOKEN_RE.fullmatch(name):
+            parser.error(
+                "--add-header name %r is not a valid HTTP header name (RFC 9110 token)" % name
+            )
+        if any(c != "\t" and (ord(c) < 32 or ord(c) == 127) for c in value):
+            parser.error("--add-header value must not contain control characters: %s" % entry)
+        try:
+            (name + value).encode("iso-8859-1")
+        except UnicodeEncodeError:
+            parser.error("--add-header must be ISO-8859-1 text: %s" % entry)
+        if name.lower() in FRAMING_HEADERS:
+            parser.error("--add-header cannot set %s (it controls message framing)" % name)
+        # Set semantics apply among the options too: the last value given for
+        # a (case-insensitive) name wins.
+        add_headers = [h for h in add_headers if h[0].lower() != name.lower()]
+        add_headers.append((name, value))
+
     # Configure logging
     logging_config = {
         "level": logging.DEBUG if args.debug else logging.INFO,
@@ -1280,6 +1499,20 @@ def main():
     server = MyHTTPServer(("127.0.0.1", port), ReverseHandler if args.reverse else ProxyHandler)
     if not configure_intercept(server, args):
         return 1
+
+    # Injected headers only ever go to explicitly mapped hosts, never to
+    # unrelated real hosts.
+    server.add_headers = add_headers
+    server.add_header_hosts = set(overrides)
+    if add_headers:
+        if overrides:
+            logger.info(
+                "Setting request header(s) %s on traffic to: %s",
+                ", ".join(name for name, _ in add_headers),
+                ", ".join(sorted(overrides)),
+            )
+        else:
+            logger.warning("--add-header has no effect without --map; no headers will be set")
 
     # Reverse/transparent mode: serve in the foreground until interrupted.
     if args.reverse:

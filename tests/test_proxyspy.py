@@ -1,6 +1,7 @@
 import ipaddress
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -108,17 +109,30 @@ class _OriginHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass  # keep test output quiet
 
+    def _echo(self, body_length=None):
+        """JSON echo of the request. header_list preserves duplicates (which
+        the headers dict collapses); peer_port identifies the upstream TCP
+        connection, so tests can confirm keep-alive reuse."""
+        body = json.dumps(
+            {
+                "url": self.path,
+                "headers": dict(self.headers),
+                "header_list": list(self.headers.items()),
+                "tls": isinstance(self.connection, ssl.SSLSocket),
+                "peer_port": self.client_address[1],
+                "body_length": body_length,
+            }
+        ).encode()
+        self._respond(200, body, "application/json")
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        self._echo(body_length=len(self.rfile.read(length)))
+
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         if path == "/get":
-            body = json.dumps(
-                {
-                    "url": self.path,
-                    "headers": dict(self.headers),
-                    "tls": isinstance(self.connection, ssl.SSLSocket),
-                }
-            ).encode()
-            self._respond(200, body, "application/json")
+            self._echo()
         elif path.startswith("/bytes/"):
             try:
                 n = int(path.rsplit("/", 1)[1])
@@ -137,14 +151,25 @@ class _OriginHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+class _KeepAliveOriginHandler(_OriginHandler):
+    """HTTP/1.1 variant that keeps connections open between requests."""
+
+    protocol_version = "HTTP/1.1"
+
+
 class LocalOrigin:
     """In-process HTTPS origin so the forwarding tests don't depend on a public
     server. Cross-platform and available to local `pytest` runs. With
     tls=False it serves plain HTTP instead (a stand-in for a local dev server
-    such as `wrangler dev`)."""
+    such as `wrangler dev`). With keepalive=True it speaks HTTP/1.1 and keeps
+    connections open between requests."""
 
-    def __init__(self, cert_dir, tls=True):
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _OriginHandler)
+    def __init__(self, cert_dir, tls=True, keepalive=False):
+        handler = _KeepAliveOriginHandler if keepalive else _OriginHandler
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        # Don't let stop() wait on handler threads parked on an idle keep-alive
+        # connection.
+        self.server.block_on_close = False
         if tls:
             self.cert_path, self.key_path = _make_origin_cert(cert_dir)
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -186,6 +211,16 @@ def _capture_sni(origin):
 def plain_origin(tmp_path):
     """A running in-process plain-HTTP origin; yields the LocalOrigin instance."""
     server = LocalOrigin(str(tmp_path), tls=False)
+    try:
+        yield server
+    finally:
+        server.stop()
+
+
+@pytest.fixture
+def keepalive_origin(tmp_path):
+    """A running in-process plain-HTTP/1.1 keep-alive origin."""
+    server = LocalOrigin(str(tmp_path), tls=False, keepalive=True)
     try:
         yield server
     finally:
@@ -1010,6 +1045,283 @@ def test_parse_upstream_rejects(value):
 
 
 #
+# Request header injection (--add-header)
+#
+
+
+def _header_values(data, name):
+    """All values of header name (case-insensitive) from an origin echo."""
+    return [v for k, v in data["header_list"] if k.lower() == name.lower()]
+
+
+def _start_add_header_proxy(proxy, origin_port, *headers, trust=None, map_host=MAPPED_HOST):
+    args = ["--map", f"{map_host}=http://127.0.0.1:{origin_port}"]
+    for header in headers:
+        args += ["--add-header", header]
+    proxy.start_proxy(*args, trust=trust)
+
+
+def test_add_header_replaces_existing(proxy, keepalive_origin):
+    """--add-header sets the header: a client-sent header of the same name
+    (any case) is replaced, not duplicated, and the rewritten head is logged.
+    The --map host is given in upper case to check host matching ignores case."""
+    _start_add_header_proxy(
+        proxy,
+        keepalive_origin.port,
+        "X-Test: 1",
+        "CF-Connecting-IP: 203.0.113.7",
+        map_host=MAPPED_HOST.upper(),
+    )
+
+    with requests.Session() as s:
+        resp = s.get(f"https://{MAPPED_HOST}/get", headers={"x-test": "client"}, timeout=10)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert _header_values(data, "X-Test") == ["1"]
+    assert _header_values(data, "CF-Connecting-IP") == ["203.0.113.7"]
+    assert data["headers"]["Host"] == MAPPED_HOST
+    proxy.assert_log_contains("| X-Test: 1")
+    proxy.assert_log_contains("| CF-Connecting-IP: 203.0.113.7")
+    assert not any("x-test: client" in line for line in proxy.get_logs())
+
+
+def test_add_header_every_request_on_keepalive(proxy, keepalive_origin):
+    """Every request on a reused (keep-alive) connection carries the header,
+    not just the first."""
+    _start_add_header_proxy(proxy, keepalive_origin.port, "X-Test: 1")
+
+    with requests.Session() as s:
+        results = [
+            s.get(f"https://{MAPPED_HOST}/get?n={i}", headers={"X-Test": "client"}, timeout=10)
+            for i in range(3)
+        ]
+    datas = [r.json() for r in results]
+    for data in datas:
+        assert _header_values(data, "X-Test") == ["1"], data["url"]
+    # All three went over one upstream connection, so reuse really happened.
+    assert len({d["peer_port"] for d in datas}) == 1
+    logs = proxy.get_logs(force=True)
+    assert sum(f"CONNECT {MAPPED_HOST}:443" in line for line in logs) == 1
+
+
+def test_add_header_frames_request_bodies(proxy, keepalive_origin):
+    """A Content-Length body is forwarded intact (even if it looks like a
+    request head) and the following request on the connection still gets the
+    header."""
+    _start_add_header_proxy(proxy, keepalive_origin.port, "X-Test: 1")
+    # Large enough to span several reads, and containing a decoy request head
+    # that a naive "find the next CRLFCRLF" rewriter would mangle.
+    decoy = b"\r\n\r\nGET /decoy HTTP/1.1\r\nX-Test: decoy\r\n\r\n"
+    body = b"a" * 150_000 + decoy + b"b" * 1000
+
+    with requests.Session() as s:
+        posted = s.post(f"https://{MAPPED_HOST}/post", data=body, timeout=10).json()
+        after = s.get(f"https://{MAPPED_HOST}/get", timeout=10).json()
+
+    assert posted["body_length"] == len(body)
+    assert _header_values(posted, "X-Test") == ["1"]
+    assert _header_values(after, "X-Test") == ["1"]
+    assert after["url"] == "/get"
+    assert posted["peer_port"] == after["peer_port"]
+
+
+def test_add_header_skips_unmapped_hosts(proxy, session, origin, keepalive_origin):
+    """Hosts without a --map entry receive no injected header."""
+    _start_add_header_proxy(proxy, keepalive_origin.port, "X-Test: 1", trust=origin.cert_path)
+
+    data = session.get(f"{origin.base_url}/get", timeout=10).json()
+    assert data["tls"] is True
+    assert _header_values(data, "X-Test") == []
+
+    with requests.Session() as s:
+        mapped = s.get(f"https://{MAPPED_HOST}/get", timeout=10).json()
+    assert _header_values(mapped, "X-Test") == ["1"]
+
+
+def test_add_header_invalid_format():
+    result = _run_proxyspy_cli("--add-header", "NoColonHere", "--", "echo", "hi")
+    assert result.returncode == 2
+    assert "--add-header expects" in result.stderr
+
+
+@pytest.mark.parametrize("header", ["X(Y: 1", "X Y: 1", "X\u00e9: 1", "X-Test: a\x01b"])
+def test_add_header_rejects_invalid_name_or_value(header):
+    result = _run_proxyspy_cli("--add-header", header, "--", "echo", "hi")
+    assert result.returncode == 2
+    assert "--add-header" in result.stderr
+
+
+def test_add_header_repeated_name_last_wins(proxy, keepalive_origin):
+    """Repeating --add-header with the same name (any case) keeps only the
+    last value, consistent with set semantics, rather than sending both."""
+    _start_add_header_proxy(proxy, keepalive_origin.port, "X-Test: first", "x-test: second")
+
+    with requests.Session() as s:
+        data = s.get(f"https://{MAPPED_HOST}/get", headers={"X-Test": "client"}, timeout=10).json()
+    assert [(k, v) for k, v in data["header_list"] if k.lower() == "x-test"] == [
+        ("x-test", "second")
+    ]
+
+
+def test_add_header_rejects_framing_header():
+    result = _run_proxyspy_cli("--add-header", "Content-Length: 5", "--", "echo", "hi")
+    assert result.returncode == 2
+    assert "message framing" in result.stderr
+
+
+def _run_framer(chunks, headers=(("X-Test", "1"),)):
+    """Feed chunks through a RequestFramer; return (output bytes, heads, warnings)."""
+    framer = proxyspy.RequestFramer(list(headers))
+    out, heads, warnings = b"", [], []
+    for chunk in chunks:
+        for kind, payload in framer.feed(chunk):
+            if kind == "warn":
+                warnings.append(payload)
+            else:
+                out += payload
+                if kind == "head":
+                    heads.append(payload)
+    return out, heads, warnings
+
+
+def test_request_framer_sets_header_preserving_order():
+    req = b"GET / HTTP/1.1\r\nHost: h\r\nx-test: old\r\nAccept: */*\r\n\r\n"
+    out, heads, warnings = _run_framer([req])
+    assert out == b"GET / HTTP/1.1\r\nHost: h\r\nAccept: */*\r\nX-Test: 1\r\n\r\n"
+    assert len(heads) == 1 and not warnings
+
+
+def test_request_framer_head_split_across_reads():
+    req = b"GET / HTTP/1.1\r\nHost: h\r\n\r\n"
+    whole, _, _ = _run_framer([req])
+    bytewise, heads, warnings = _run_framer([bytes([c]) for c in req])
+    assert bytewise == whole == b"GET / HTTP/1.1\r\nHost: h\r\nX-Test: 1\r\n\r\n"
+    assert len(heads) == 1 and not warnings
+
+
+def test_request_framer_pipelined_with_bodies():
+    body = b"x\r\n\r\nGET /no HTTP/1.1\r\n\r\n"
+    req1 = b"POST /a HTTP/1.1\r\nContent-Length: %d\r\n\r\n" % len(body) + body
+    req2 = b"GET /b HTTP/1.1\r\nX-TEST: dup\r\n\r\n"
+    out, heads, warnings = _run_framer([req1 + req2])
+    assert out == (
+        b"POST /a HTTP/1.1\r\nContent-Length: %d\r\nX-Test: 1\r\n\r\n" % len(body)
+        + body
+        + b"GET /b HTTP/1.1\r\nX-Test: 1\r\n\r\n"
+    )
+    assert len(heads) == 2 and not warnings
+
+
+def test_request_framer_chunked_falls_back_to_passthrough():
+    req1 = b"POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n"
+    req2 = b"GET /b HTTP/1.1\r\n\r\n"
+    out, heads, warnings = _run_framer([req1, req2])
+    # The chunked request's own head is still rewritten; everything after it,
+    # including the next request, passes through unmodified.
+    assert out == (
+        b"POST /a HTTP/1.1\r\nTransfer-Encoding: chunked\r\nX-Test: 1\r\n\r\n"
+        b"3\r\nabc\r\n0\r\n\r\n" + req2
+    )
+    assert len(heads) == 1
+    assert len(warnings) == 1 and "Transfer-Encoding: chunked" in warnings[0]
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        b"NOT A REQUEST\r\n\r\n",
+        b"GET / HTTP/2\r\n\r\n",
+        b"GET / HTTP/1.1\r\nno-colon\r\n\r\n",
+        b"GET / HTTP/1.1\r\nA: b\r\n folded\r\n\r\n",
+        b"GET / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
+        b"GET / HTTP/1.1\r\nContent-Length: -1\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: h\nX-Smuggled: 1\r\n\r\n",
+    ],
+)
+def test_request_framer_unparseable_passthrough(head):
+    trailer = b"GET /next HTTP/1.1\r\n\r\n"
+    out, heads, warnings = _run_framer([head + trailer])
+    assert out == head + trailer
+    assert heads == []
+    assert len(warnings) == 1 and "unparseable" in warnings[0]
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        b"GET / HTTP/1.1\nHost: h\n\n",
+        b"GET / HTTP/1.1\r\nHost: h\n\n",
+        b"GET / HTTP/1.1\r\nHost: h\n\r\n",
+    ],
+)
+def test_request_framer_bare_lf_head_passthrough(head):
+    """A bare-LF head falls back to passthrough immediately rather than
+    stalling while waiting for a CRLFCRLF that never comes."""
+    out, heads, warnings = _run_framer([head])
+    assert out == head
+    assert heads == []
+    assert len(warnings) == 1 and "bare LF" in warnings[0]
+
+
+def test_request_framer_bare_lf_after_good_request():
+    good = b"GET /a HTTP/1.1\r\n\r\n"
+    bad = b"GET /b HTTP/1.1\nHost: h\n\n"
+    out, heads, warnings = _run_framer([good + bad])
+    assert out == b"GET /a HTTP/1.1\r\nX-Test: 1\r\n\r\n" + bad
+    assert len(heads) == 1 and len(warnings) == 1
+
+
+def test_request_framer_oversized_head_passthrough():
+    junk = b"A" * (proxyspy.MAX_REQUEST_HEAD + 1)
+    out, heads, warnings = _run_framer([junk, b"more"])
+    assert out == junk + b"more"
+    assert heads == [] and len(warnings) == 1
+
+
+@pytest.mark.parametrize("split", [False, True])
+def test_request_framer_oversized_complete_head_passthrough(split):
+    """A head over the limit falls back to passthrough even when its
+    terminator is already buffered, whether it arrives in the same read or
+    the next one, so the outcome does not depend on read boundaries."""
+    head = b"GET / HTTP/1.1\r\nX-Big: " + b"a" * proxyspy.MAX_REQUEST_HEAD + b"\r\n\r\n"
+    trailer = b"GET /next HTTP/1.1\r\n\r\n"
+    chunks = [head[:-4], head[-4:] + trailer] if split else [head + trailer]
+    out, heads, warnings = _run_framer(chunks)
+    assert out == head + trailer
+    assert heads == []
+    assert len(warnings) == 1 and "exceeds" in warnings[0]
+
+
+def test_request_framer_limit_ignores_body_in_same_read():
+    """Only the head counts toward the limit, not a large body (or later
+    request) that arrives in the same buffer."""
+    body = b"b" * (proxyspy.MAX_REQUEST_HEAD + 10)
+    req = b"POST / HTTP/1.1\r\nContent-Length: %d\r\n\r\n" % len(body) + body
+    out, heads, warnings = _run_framer([req + b"GET /next HTTP/1.1\r\n\r\n"])
+    assert len(heads) == 2 and not warnings
+    assert out.count(b"X-Test: 1\r\n") == 2
+
+
+def test_request_framer_configured_upgrade_passthrough():
+    """An Upgrade header supplied by --add-header (not the client) also means
+    the server may switch protocols, so later bytes pass through unchanged
+    instead of being buffered as another request head."""
+    req = b"GET /ws HTTP/1.1\r\nHost: h\r\n\r\n"
+    frame = b"\x81\x05hello"
+    out, heads, warnings = _run_framer([req, frame], headers=[("Upgrade", "websocket")])
+    assert out == b"GET /ws HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\n\r\n" + frame
+    assert len(heads) == 1
+    assert len(warnings) == 1 and "switches protocols" in warnings[0]
+
+
+def test_request_framer_upgrade_passthrough():
+    req = b"GET /ws HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+    out, heads, warnings = _run_framer([req, b"\x81\x05hello"])
+    assert out == req[:-2] + b"X-Test: 1\r\n\r\n" + b"\x81\x05hello"
+    assert len(heads) == 1 and len(warnings) == 1
+
+
+#
 # Reverse / transparent mode
 #
 
@@ -1379,6 +1691,36 @@ def test_connect_upstream_raises_when_all_fail():
     port = proxyspy.find_free_port()
     with pytest.raises(OSError):
         proxyspy.connect_upstream(proxyspy.Upstream("http", "x", port, ("127.0.0.1",)))
+
+
+def test_reverse_add_header_keepalive(reverse, keepalive_origin):
+    """--add-header works in reverse mode too, on every request of a
+    keep-alive connection."""
+    reverse.start(
+        "--map",
+        f"{MAPPED_HOST}=http://127.0.0.1:{keepalive_origin.port}",
+        "--add-header",
+        "X-Test: 1",
+    )
+
+    sock = reverse.connect(MAPPED_HOST)
+    req = "GET /get?n=%d HTTP/1.1\r\nHost: " + MAPPED_HOST + "\r\nX-Test: client\r\n%s\r\n"
+    # Pipeline two requests on one connection; the second asks the origin to
+    # close afterwards so we can read to EOF.
+    sock.sendall((req % (1, "") + req % (2, "Connection: close\r\n")).encode())
+    response = _read_all(sock)
+    sock.close()
+
+    bodies = []
+    while response:
+        head, _, rest = response.partition(b"\r\n\r\n")
+        length = int(re.search(rb"(?i)\r\ncontent-length: *(\d+)", head).group(1))
+        bodies.append(json.loads(rest[:length]))
+        response = rest[length:]
+    assert [b["url"] for b in bodies] == ["/get?n=1", "/get?n=2"]
+    for body in bodies:
+        assert _header_values(body, "X-Test") == ["1"]
+    assert bodies[0]["peer_port"] == bodies[1]["peer_port"]
 
 
 #
