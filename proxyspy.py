@@ -409,9 +409,15 @@ class RequestFramer:
             # bare-LF, so a non-conforming bare-LF client falls back to
             # passthrough instead of stalling until the idle timeout.
             match = _BLANK_LINE_RE.search(self._buffer)
+            # Apply the size limit to the completed head when we have one (not
+            # counting a body or later request in the same buffer), otherwise
+            # to what is buffered so far, so the outcome does not depend on
+            # where read boundaries fall.
+            head_length = match.end() if match is not None else len(self._buffer)
+            if head_length > MAX_REQUEST_HEAD:
+                self._go_raw(events, "request head exceeds %d bytes" % MAX_REQUEST_HEAD)
+                break
             if match is None:
-                if len(self._buffer) > MAX_REQUEST_HEAD:
-                    self._go_raw(events, "request head exceeds %d bytes" % MAX_REQUEST_HEAD)
                 break
             if match.group() != b"\r\n\r\n":
                 self._go_raw(events, "request head uses bare LF line endings")
@@ -468,7 +474,9 @@ class RequestFramer:
         if "transfer-encoding" in values:
             reason = "request uses Transfer-Encoding: %s" % ", ".join(values["transfer-encoding"])
             return new_head, 0, reason
-        if "upgrade" in values or parts[0].upper() == "CONNECT":
+        # A configured Upgrade header is in new_head but not in values; the
+        # server may switch protocols either way.
+        if "upgrade" in values or "upgrade" in self._names or parts[0].upper() == "CONNECT":
             return new_head, 0, "request switches protocols"
         lengths = set(values.get("content-length", ()))
         if len(lengths) > 1:
@@ -1414,6 +1422,9 @@ def main():
             parser.error("--add-header must be ISO-8859-1 text: %s" % entry)
         if name.lower() in FRAMING_HEADERS:
             parser.error("--add-header cannot set %s (it controls message framing)" % name)
+        # Set semantics apply among the options too: the last value given for
+        # a (case-insensitive) name wins.
+        add_headers = [h for h in add_headers if h[0].lower() != name.lower()]
         add_headers.append((name, value))
 
     # Configure logging

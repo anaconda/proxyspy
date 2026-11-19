@@ -1151,6 +1151,18 @@ def test_add_header_rejects_invalid_name_or_value(header):
     assert "--add-header" in result.stderr
 
 
+def test_add_header_repeated_name_last_wins(proxy, keepalive_origin):
+    """Repeating --add-header with the same name (any case) keeps only the
+    last value, consistent with set semantics, rather than sending both."""
+    _start_add_header_proxy(proxy, keepalive_origin.port, "X-Test: first", "x-test: second")
+
+    with requests.Session() as s:
+        data = s.get(f"https://{MAPPED_HOST}/get", headers={"X-Test": "client"}, timeout=10).json()
+    assert [(k, v) for k, v in data["header_list"] if k.lower() == "x-test"] == [
+        ("x-test", "second")
+    ]
+
+
 def test_add_header_rejects_framing_header():
     result = _run_proxyspy_cli("--add-header", "Content-Length: 5", "--", "echo", "hi")
     assert result.returncode == 2
@@ -1264,6 +1276,42 @@ def test_request_framer_oversized_head_passthrough():
     out, heads, warnings = _run_framer([junk, b"more"])
     assert out == junk + b"more"
     assert heads == [] and len(warnings) == 1
+
+
+@pytest.mark.parametrize("split", [False, True])
+def test_request_framer_oversized_complete_head_passthrough(split):
+    """A head over the limit falls back to passthrough even when its
+    terminator is already buffered, whether it arrives in the same read or
+    the next one, so the outcome does not depend on read boundaries."""
+    head = b"GET / HTTP/1.1\r\nX-Big: " + b"a" * proxyspy.MAX_REQUEST_HEAD + b"\r\n\r\n"
+    trailer = b"GET /next HTTP/1.1\r\n\r\n"
+    chunks = [head[:-4], head[-4:] + trailer] if split else [head + trailer]
+    out, heads, warnings = _run_framer(chunks)
+    assert out == head + trailer
+    assert heads == []
+    assert len(warnings) == 1 and "exceeds" in warnings[0]
+
+
+def test_request_framer_limit_ignores_body_in_same_read():
+    """Only the head counts toward the limit, not a large body (or later
+    request) that arrives in the same buffer."""
+    body = b"b" * (proxyspy.MAX_REQUEST_HEAD + 10)
+    req = b"POST / HTTP/1.1\r\nContent-Length: %d\r\n\r\n" % len(body) + body
+    out, heads, warnings = _run_framer([req + b"GET /next HTTP/1.1\r\n\r\n"])
+    assert len(heads) == 2 and not warnings
+    assert out.count(b"X-Test: 1\r\n") == 2
+
+
+def test_request_framer_configured_upgrade_passthrough():
+    """An Upgrade header supplied by --add-header (not the client) also means
+    the server may switch protocols, so later bytes pass through unchanged
+    instead of being buffered as another request head."""
+    req = b"GET /ws HTTP/1.1\r\nHost: h\r\n\r\n"
+    frame = b"\x81\x05hello"
+    out, heads, warnings = _run_framer([req, frame], headers=[("Upgrade", "websocket")])
+    assert out == b"GET /ws HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\n\r\n" + frame
+    assert len(heads) == 1
+    assert len(warnings) == 1 and "switches protocols" in warnings[0]
 
 
 def test_request_framer_upgrade_passthrough():

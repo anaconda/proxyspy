@@ -204,10 +204,10 @@ proxyspy --map example.com=http://127.0.0.1:8787 \
 
 Behavior:
 
-* **Set semantics.** Any existing header with the same name (case-insensitive) is removed and the given one is added, so a header sent by the client is replaced, never duplicated. Repeat the option to set several headers.
+* **Set semantics.** Any existing header with the same name (case-insensitive) is removed and the given one is added, so a header sent by the client is replaced, never duplicated. Repeat the option to set several headers; if the same name (in any case) is given more than once, the last value wins.
 * **Mapped hosts only.** Headers are applied only to traffic for hosts with a `--map` entry, so they are never sent to unrelated real hosts. Without `--map`, `--add-header` has no effect (proxyspy logs a warning).
 * **Every request.** Clients such as `requests`/conda reuse keep-alive connections, so proxyspy frames the client's requests and rewrites each request head on the connection, not just the first. Request bodies with a `Content-Length` are forwarded untouched. The rewritten heads appear in the log.
-* **Fallback.** proxyspy does not decode request bodies. If a request uses `Transfer-Encoding` (e.g. chunked uploads), asks for a protocol upgrade (e.g. WebSocket), or its head cannot be parsed, proxyspy logs a warning and passes the rest of that connection through unmodified. The current request still gets the headers if its head was parsed; later requests on that connection do not.
+* **Fallback.** proxyspy does not decode request bodies. If a request uses `Transfer-Encoding` (e.g. chunked uploads), asks for a protocol upgrade (e.g. WebSocket, including an `Upgrade` header set with `--add-header`), or its head cannot be parsed, proxyspy logs a warning and passes the rest of that connection through unmodified. The current request still gets the headers if its head was parsed; later requests on that connection do not.
 * Responses are never modified, and `Content-Length`/`Transfer-Encoding` cannot be set (they control message framing). Works in forward and reverse modes.
 
 ## Standalone Forward Mode
