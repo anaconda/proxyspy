@@ -346,6 +346,13 @@ def connect_upstream(upstream):
 # while looking for the terminating blank line before giving up.
 MAX_REQUEST_HEAD = 65536
 
+# A blank line ending a request head: CRLFCRLF, or a bare-LF variant (which
+# RequestFramer detects only in order to fall back to passthrough).
+_BLANK_LINE_RE = re.compile(rb"\r?\n\r?\n")
+
+# RFC 9110 section 5.6.2 "token": the allowed characters of a header name.
+_TOKEN_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+
 # --add-header may not set these: they determine message framing, so changing
 # them would desynchronize the framer from what the upstream server parses.
 FRAMING_HEADERS = frozenset(("content-length", "transfer-encoding"))
@@ -398,13 +405,19 @@ class RequestFramer:
                 self._buffer = self._buffer[2:]
                 events.append(("data", b"\r\n"))
                 continue
-            end = self._buffer.find(b"\r\n\r\n")
-            if end < 0:
+            # The first blank line ends the head. Find it whether it is CRLF or
+            # bare-LF, so a non-conforming bare-LF client falls back to
+            # passthrough instead of stalling until the idle timeout.
+            match = _BLANK_LINE_RE.search(self._buffer)
+            if match is None:
                 if len(self._buffer) > MAX_REQUEST_HEAD:
                     self._go_raw(events, "request head exceeds %d bytes" % MAX_REQUEST_HEAD)
                 break
-            head = self._buffer[: end + 4]
-            self._buffer = self._buffer[end + 4 :]  # noqa
+            if match.group() != b"\r\n\r\n":
+                self._go_raw(events, "request head uses bare LF line endings")
+                break
+            head = self._buffer[: match.end()]
+            self._buffer = self._buffer[match.end() :]  # noqa
             try:
                 new_head, body_length, passthrough = self._rewrite(head)
             except ValueError as exc:
@@ -431,6 +444,8 @@ class RequestFramer:
         """Return (new_head, body_length, passthrough_reason) for one request
         head, or raise ValueError if it is not a parseable HTTP/1.x head."""
         lines = head[:-4].decode("iso-8859-1").split("\r\n")
+        if any("\r" in line or "\n" in line for line in lines):
+            raise ValueError("bare CR or LF in request head")
         request_line = lines[0]
         parts = request_line.split(" ")
         if len(parts) != 3 or not parts[0] or not parts[2].startswith("HTTP/1."):
@@ -623,7 +638,7 @@ class ConnLoggingMixin:
                 # Only frame/rewrite requests for hosts that need it; everything
                 # else uses the plain byte relay.
                 framer = None
-                if self.server.add_headers and host in self.server.add_header_hosts:
+                if self.server.add_headers and host.lower() in self.server.add_header_hosts:
                     self._log(
                         "Setting %d request header(s) on every request to %s",
                         len(self.server.add_headers),
@@ -1385,10 +1400,14 @@ def main():
     for entry in args.add_header or []:
         name, sep, value = entry.partition(":")
         name, value = name.strip(), value.strip()
-        if not sep or not name or any(c in name for c in " \t\r\n"):
+        if not sep or not name:
             parser.error('--add-header expects "Name: Value", got: %s' % entry)
-        if "\r" in value or "\n" in value:
-            parser.error("--add-header value must not contain line breaks: %s" % entry)
+        if not _TOKEN_RE.fullmatch(name):
+            parser.error(
+                "--add-header name %r is not a valid HTTP header name (RFC 9110 token)" % name
+            )
+        if any(c != "\t" and (ord(c) < 32 or ord(c) == 127) for c in value):
+            parser.error("--add-header value must not contain control characters: %s" % entry)
         try:
             (name + value).encode("iso-8859-1")
         except UnicodeEncodeError:

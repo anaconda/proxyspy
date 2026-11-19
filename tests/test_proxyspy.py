@@ -1054,8 +1054,8 @@ def _header_values(data, name):
     return [v for k, v in data["header_list"] if k.lower() == name.lower()]
 
 
-def _start_add_header_proxy(proxy, origin_port, *headers, trust=None):
-    args = ["--map", f"{MAPPED_HOST}=http://127.0.0.1:{origin_port}"]
+def _start_add_header_proxy(proxy, origin_port, *headers, trust=None, map_host=MAPPED_HOST):
+    args = ["--map", f"{map_host}=http://127.0.0.1:{origin_port}"]
     for header in headers:
         args += ["--add-header", header]
     proxy.start_proxy(*args, trust=trust)
@@ -1063,9 +1063,14 @@ def _start_add_header_proxy(proxy, origin_port, *headers, trust=None):
 
 def test_add_header_replaces_existing(proxy, keepalive_origin):
     """--add-header sets the header: a client-sent header of the same name
-    (any case) is replaced, not duplicated, and the rewritten head is logged."""
+    (any case) is replaced, not duplicated, and the rewritten head is logged.
+    The --map host is given in upper case to check host matching ignores case."""
     _start_add_header_proxy(
-        proxy, keepalive_origin.port, "X-Test: 1", "CF-Connecting-IP: 203.0.113.7"
+        proxy,
+        keepalive_origin.port,
+        "X-Test: 1",
+        "CF-Connecting-IP: 203.0.113.7",
+        map_host=MAPPED_HOST.upper(),
     )
 
     with requests.Session() as s:
@@ -1137,6 +1142,13 @@ def test_add_header_invalid_format():
     result = _run_proxyspy_cli("--add-header", "NoColonHere", "--", "echo", "hi")
     assert result.returncode == 2
     assert "--add-header expects" in result.stderr
+
+
+@pytest.mark.parametrize("header", ["X(Y: 1", "X Y: 1", "X\u00e9: 1", "X-Test: a\x01b"])
+def test_add_header_rejects_invalid_name_or_value(header):
+    result = _run_proxyspy_cli("--add-header", header, "--", "echo", "hi")
+    assert result.returncode == 2
+    assert "--add-header" in result.stderr
 
 
 def test_add_header_rejects_framing_header():
@@ -1211,6 +1223,7 @@ def test_request_framer_chunked_falls_back_to_passthrough():
         b"GET / HTTP/1.1\r\nA: b\r\n folded\r\n\r\n",
         b"GET / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n",
         b"GET / HTTP/1.1\r\nContent-Length: -1\r\n\r\n",
+        b"GET / HTTP/1.1\r\nHost: h\nX-Smuggled: 1\r\n\r\n",
     ],
 )
 def test_request_framer_unparseable_passthrough(head):
@@ -1219,6 +1232,31 @@ def test_request_framer_unparseable_passthrough(head):
     assert out == head + trailer
     assert heads == []
     assert len(warnings) == 1 and "unparseable" in warnings[0]
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        b"GET / HTTP/1.1\nHost: h\n\n",
+        b"GET / HTTP/1.1\r\nHost: h\n\n",
+        b"GET / HTTP/1.1\r\nHost: h\n\r\n",
+    ],
+)
+def test_request_framer_bare_lf_head_passthrough(head):
+    """A bare-LF head falls back to passthrough immediately rather than
+    stalling while waiting for a CRLFCRLF that never comes."""
+    out, heads, warnings = _run_framer([head])
+    assert out == head
+    assert heads == []
+    assert len(warnings) == 1 and "bare LF" in warnings[0]
+
+
+def test_request_framer_bare_lf_after_good_request():
+    good = b"GET /a HTTP/1.1\r\n\r\n"
+    bad = b"GET /b HTTP/1.1\nHost: h\n\n"
+    out, heads, warnings = _run_framer([good + bad])
+    assert out == b"GET /a HTTP/1.1\r\nX-Test: 1\r\n\r\n" + bad
+    assert len(heads) == 1 and len(warnings) == 1
 
 
 def test_request_framer_oversized_head_passthrough():
