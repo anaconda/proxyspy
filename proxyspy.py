@@ -83,6 +83,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from os.path import isfile, join
@@ -635,26 +636,39 @@ def _chown_to_sudo_user(path):
 
 HOSTS_PATH = "/etc/hosts"
 HOSTS_BAK = "/etc/hosts.proxyspy.bak"
+# Lock file suffix: <hosts_path> + this, e.g. /etc/hosts.proxyspy.lock
+HOSTS_LOCK_SUFFIX = ".proxyspy.lock"
 FENCE_BEGIN = "# >>> proxyspy %d >>>"
 FENCE_END = "# <<< proxyspy %d <<<"
 
 # Each block's fences carry the owner PID (e.g. "# >>> proxyspy 12345 >>>") so
 # concurrent --manage-hosts sessions can tell their own block apart from other
-# live sessions' blocks. The PID group is optional so blocks written by older
-# versions (fence text alone) are still recognised and cleaned up.
+# live sessions' blocks. Blocks written by older versions (fence text alone,
+# no PID) are still recognised and cleaned up.
 #
-# Non-greedy + DOTALL so multiple blocks are each matched individually. An
-# unmatched begin fence (no following end fence) is deliberately left alone
-# rather than consuming the rest of the file.
+# The two formats are separate alternatives, and a tagged block's end fence
+# must name the same PID as its begin fence. Non-greedy + DOTALL so multiple
+# blocks are each matched individually. An unmatched begin fence (no matching
+# end fence) is deliberately left alone rather than consuming the rest of the
+# file, or another session's block that happens to follow it.
 _MANAGED_BLOCK_RE = re.compile(
-    r"^# >>> proxyspy(?: (?P<pid>\d+))? >>>\n" r".*?" r"^# <<< proxyspy(?: \d+)? <<<\n?",
+    # PID-tagged blocks: both fences must name the same PID.
+    r"^# >>> proxyspy (?P<pid>\d+) >>>\n" r".*?" r"^# <<< proxyspy (?P=pid) <<<(?:\n|\Z)"
+    # Legacy blocks: neither fence has a PID.
+    r"|^# >>> proxyspy >>>\n" r".*?" r"^# <<< proxyspy <<<(?:\n|\Z)",
     re.DOTALL | re.MULTILINE,
 )
 
 
 def _pid_alive(pid):
     """Return True if a live process currently holds PID. POSIX-only, which
-    matches the rest of /etc/hosts management (--manage-hosts is POSIX-only)."""
+    matches the rest of /etc/hosts management (--manage-hosts is POSIX-only).
+
+    Refuses to run elsewhere: on Windows os.kill(pid, 0) sends CTRL_C_EVENT,
+    and on Python 3.10 a failed console event falls through to
+    TerminateProcess, so it could kill the target instead of probing it."""
+    if os.name != "posix":
+        raise NotImplementedError("PID liveness checks are POSIX-only")
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -707,6 +721,30 @@ def _fenced_block(hosts):
     return "\n".join(lines) + "\n"
 
 
+@contextmanager
+def _hosts_lock(hosts_path):
+    """Serialize proxyspy's read-modify-write cycles on hosts_path across
+    processes, so concurrent sessions cannot each read the file and then
+    write back a version that resurrects or drops the other's block.
+
+    Locks a separate, persistent lock file next to hosts_path rather than
+    hosts_path itself: _atomic_write() replaces hosts_path's inode, which
+    would silently release a lock held on the old one. The lock file is never
+    removed (removing it would reopen the race). POSIX-only (flock); a no-op
+    elsewhere, where --manage-hosts is unavailable anyway."""
+    if os.name != "posix":
+        yield
+        return
+    import fcntl
+
+    fd = os.open(hosts_path + HOSTS_LOCK_SUFFIX, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # closing the descriptor releases the lock
+
+
 def _atomic_write(path, text):
     """Write text to path atomically: temp file in the same directory,
     flush+fsync, then os.replace() so the file is never observed
@@ -747,18 +785,19 @@ def write_managed_hosts(hosts, hosts_path=HOSTS_PATH, bak_path=HOSTS_BAK):
     proxyspy process is left untouched, so concurrent --manage-hosts sessions
     do not clobber each other. Backs up hosts_path to bak_path once, on first
     mutation; the backup is never overwritten or touched by removal."""
-    try:
-        with open(hosts_path) as f:
-            current = f.read()
-    except FileNotFoundError:
-        current = ""
-    else:
-        if not os.path.exists(bak_path):
-            shutil.copy2(hosts_path, bak_path)
-    stripped = _strip_managed_block(current, keep=_keep_live_foreign_block)
-    if stripped and not stripped.endswith("\n"):
-        stripped += "\n"
-    _atomic_write(hosts_path, stripped + _fenced_block(hosts))
+    with _hosts_lock(hosts_path):
+        try:
+            with open(hosts_path) as f:
+                current = f.read()
+        except FileNotFoundError:
+            current = ""
+        else:
+            if not os.path.exists(bak_path):
+                shutil.copy2(hosts_path, bak_path)
+        stripped = _strip_managed_block(current, keep=_keep_live_foreign_block)
+        if stripped and not stripped.endswith("\n"):
+            stripped += "\n"
+        _atomic_write(hosts_path, stripped + _fenced_block(hosts))
 
 
 def remove_managed_hosts(hosts_path=HOSTS_PATH, pid=None, drop_dead=False):
@@ -769,30 +808,29 @@ def remove_managed_hosts(hosts_path=HOSTS_PATH, pid=None, drop_dead=False):
     --restore-hosts). pid=<int> removes only the block owned by that PID, so a
     clean exit leaves other sessions' blocks alone. drop_dead=True removes only
     blocks whose owner is no longer running, so startup self-heal clears a
-    stale block without touching a concurrent live session."""
-    try:
-        with open(hosts_path) as f:
-            current = f.read()
-    except FileNotFoundError:
-        return False
-
+    stale block without touching a concurrent live session. A block tagged
+    with this process's own PID is always stale here: the PID was recycled
+    from a run that died uncleanly, since this run has not written yet."""
     if pid is not None:
 
         def keep(owner):
             return owner != pid
 
     elif drop_dead:
-
-        def keep(owner):
-            return owner is not None and _pid_alive(owner)
-
+        keep = _keep_live_foreign_block
     else:
         keep = None
 
-    stripped = _strip_managed_block(current, keep=keep)
-    if stripped == current:
-        return False
-    _atomic_write(hosts_path, stripped)
+    with _hosts_lock(hosts_path):
+        try:
+            with open(hosts_path) as f:
+                current = f.read()
+        except FileNotFoundError:
+            return False
+        stripped = _strip_managed_block(current, keep=keep)
+        if stripped == current:
+            return False
+        _atomic_write(hosts_path, stripped)
     return True
 
 

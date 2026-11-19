@@ -1250,15 +1250,23 @@ def _fenced(host, pid):
     )
 
 
-def _live_foreign_pid():
-    """A PID that is currently alive and is not ours (our parent process)."""
-    parent = psutil.Process(os.getpid()).parent()
-    assert parent is not None
-    return parent.pid
+@pytest.fixture
+def pids(monkeypatch):
+    """(live, dead) foreign PIDs with _pid_alive mocked to match.
+
+    The block-ownership tests never probe real processes: on Windows
+    os.kill(pid, 0) sends CTRL_C_EVENT and, on Python 3.10, can fall through
+    to TerminateProcess. The real liveness check is covered by the POSIX-only
+    test_pid_alive. Our own PID is reported alive, as it is in reality."""
+    mine = os.getpid()
+    live, dead = mine + 1, mine + 2
+    monkeypatch.setattr(proxyspy, "_pid_alive", lambda pid: pid in (mine, live))
+    return live, dead
 
 
 def _dead_pid():
-    """A PID that is no longer running: a child we spawned and reaped."""
+    """A PID that is no longer running: a child we spawned and reaped. Only
+    for the POSIX-only test_pid_alive; see the pids fixture."""
     proc = subprocess.Popen([sys.executable, "-c", ""])
     proc.wait()
     return proc.pid
@@ -1324,10 +1332,10 @@ def test_strip_managed_block_pid_tagged():
     assert proxyspy._strip_managed_block(text) == "127.0.0.1 localhost\n::1 localhost\n"
 
 
-def test_strip_managed_block_keeps_live_foreign_block():
+def test_strip_managed_block_keeps_live_foreign_block(pids):
     """_keep_live_foreign_block keeps a block owned by another live process
     while still removing this process's own block."""
-    foreign = _live_foreign_pid()
+    foreign, _ = pids
     mine = os.getpid()
     text = _fenced("a.example.com", foreign) + _fenced("b.example.com", mine)
     stripped = proxyspy._strip_managed_block(text, keep=proxyspy._keep_live_foreign_block)
@@ -1335,8 +1343,9 @@ def test_strip_managed_block_keeps_live_foreign_block():
     assert "b.example.com" not in stripped
 
 
-def test_strip_managed_block_drops_dead_block():
-    text = _fenced("a.example.com", _dead_pid())
+def test_strip_managed_block_drops_dead_block(pids):
+    _, dead = pids
+    text = _fenced("a.example.com", dead)
     stripped = proxyspy._strip_managed_block(text, keep=proxyspy._keep_live_foreign_block)
     assert stripped == ""
 
@@ -1418,12 +1427,12 @@ def test_remove_managed_hosts_noop_when_absent(tmp_path):
     assert hosts_path.read_text() == original
 
 
-def test_write_managed_hosts_preserves_live_foreign_block(tmp_path):
+def test_write_managed_hosts_preserves_live_foreign_block(tmp_path, pids):
     """A concurrent live session's block must survive our write, so we do not
     silently stop intercepting for that session."""
     hosts_path = tmp_path / "hosts"
     bak_path = tmp_path / "hosts.bak"
-    foreign = _live_foreign_pid()
+    foreign, _ = pids
     hosts_path.write_text("127.0.0.1 localhost\n" + _fenced("a.example.com", foreign))
 
     proxyspy.write_managed_hosts(
@@ -1436,10 +1445,11 @@ def test_write_managed_hosts_preserves_live_foreign_block(tmp_path):
     assert text.count("# >>> proxyspy") == 2
 
 
-def test_write_managed_hosts_drops_dead_block(tmp_path):
+def test_write_managed_hosts_drops_dead_block(tmp_path, pids):
+    _, dead = pids
     hosts_path = tmp_path / "hosts"
     bak_path = tmp_path / "hosts.bak"
-    hosts_path.write_text("127.0.0.1 localhost\n" + _fenced("a.example.com", _dead_pid()))
+    hosts_path.write_text("127.0.0.1 localhost\n" + _fenced("a.example.com", dead))
 
     proxyspy.write_managed_hosts(
         ["b.example.com"], hosts_path=str(hosts_path), bak_path=str(bak_path)
@@ -1451,11 +1461,11 @@ def test_write_managed_hosts_drops_dead_block(tmp_path):
     assert text.count("# >>> proxyspy") == 1
 
 
-def test_remove_managed_hosts_pid_removes_only_own(tmp_path):
+def test_remove_managed_hosts_pid_removes_only_own(tmp_path, pids):
     """Clean exit strips only our own PID's block, leaving a concurrent live
     session's block in place."""
     hosts_path = tmp_path / "hosts"
-    foreign = _live_foreign_pid()
+    foreign, _ = pids
     mine = os.getpid()
     hosts_path.write_text(
         "127.0.0.1 localhost\n" + _fenced("a.example.com", foreign) + _fenced("b.example.com", mine)
@@ -1468,14 +1478,12 @@ def test_remove_managed_hosts_pid_removes_only_own(tmp_path):
     assert "b.example.com" not in text
 
 
-def test_remove_managed_hosts_drop_dead_keeps_live(tmp_path):
+def test_remove_managed_hosts_drop_dead_keeps_live(tmp_path, pids):
     """Startup self-heal removes a stale block but never a live foreign one."""
     hosts_path = tmp_path / "hosts"
-    foreign = _live_foreign_pid()
+    foreign, dead = pids
     hosts_path.write_text(
-        "127.0.0.1 localhost\n"
-        + _fenced("a.example.com", foreign)
-        + _fenced("b.example.com", _dead_pid())
+        "127.0.0.1 localhost\n" + _fenced("a.example.com", foreign) + _fenced("b.example.com", dead)
     )
 
     assert proxyspy.remove_managed_hosts(hosts_path=str(hosts_path), drop_dead=True) is True
@@ -1485,23 +1493,111 @@ def test_remove_managed_hosts_drop_dead_keeps_live(tmp_path):
     assert "b.example.com" not in text
 
 
-def test_remove_managed_hosts_drop_dead_noop_when_all_live(tmp_path):
+def test_remove_managed_hosts_drop_dead_noop_when_all_live(tmp_path, pids):
     hosts_path = tmp_path / "hosts"
-    foreign = _live_foreign_pid()
+    foreign, _ = pids
     hosts_path.write_text("127.0.0.1 localhost\n" + _fenced("a.example.com", foreign))
 
     assert proxyspy.remove_managed_hosts(hosts_path=str(hosts_path), drop_dead=True) is False
     assert "127.0.0.1 a.example.com" in hosts_path.read_text()
 
 
-def test_remove_managed_hosts_restore_removes_live_block(tmp_path):
+def test_remove_managed_hosts_restore_removes_live_block(tmp_path, pids):
     """--restore-hosts removes every proxyspy block, live or not."""
     hosts_path = tmp_path / "hosts"
-    foreign = _live_foreign_pid()
+    foreign, _ = pids
     hosts_path.write_text("127.0.0.1 localhost\n" + _fenced("a.example.com", foreign))
 
     assert proxyspy.remove_managed_hosts(hosts_path=str(hosts_path)) is True
     assert hosts_path.read_text() == "127.0.0.1 localhost\n"
+
+
+def test_remove_managed_hosts_drop_dead_removes_recycled_own_pid(tmp_path, pids):
+    """Self-heal removes a stale block tagged with our own PID: the PID was
+    recycled from a run that died uncleanly, since this run has not written
+    its block yet. (Our own PID is alive, so a plain liveness check would
+    wrongly keep it.)"""
+    hosts_path = tmp_path / "hosts"
+    foreign, _ = pids
+    hosts_path.write_text(
+        "127.0.0.1 localhost\n"
+        + _fenced("a.example.com", foreign)
+        + _fenced("stale.example.com", os.getpid())
+    )
+
+    assert proxyspy.remove_managed_hosts(hosts_path=str(hosts_path), drop_dead=True) is True
+
+    text = hosts_path.read_text()
+    assert "127.0.0.1 a.example.com" in text
+    assert "stale.example.com" not in text
+
+
+def test_strip_managed_block_unterminated_tagged_before_other_block(pids):
+    """An unterminated tagged block followed by another PID's complete block
+    must not be matched as one block spanning both (which would delete the
+    live block and any user entries in between)."""
+    foreign, dead = pids
+    text = (
+        "127.0.0.1 localhost\n"
+        "# >>> proxyspy %d >>>\n"
+        "127.0.0.1 stale.example.com\n"
+        "10.0.0.5 user-entry\n" % dead
+    ) + _fenced("live.example.com", foreign)
+    stripped = proxyspy._strip_managed_block(text, keep=proxyspy._keep_live_foreign_block)
+    assert stripped == text
+    # Without a keep predicate only the complete block is removed.
+    assert proxyspy._strip_managed_block(text) == text[: text.index("# >>> proxyspy %d" % foreign)]
+
+
+def test_strip_managed_block_mismatched_fence_pids():
+    """Begin/end fences naming different PIDs do not form a block."""
+    text = "# >>> proxyspy 111 >>>\n127.0.0.1 a.example.com\n# <<< proxyspy 222 <<<\n"
+    assert proxyspy._strip_managed_block(text) == text
+
+
+def test_strip_managed_block_end_fence_must_end_line():
+    text = "# >>> proxyspy 111 >>>\n127.0.0.1 a.example.com\n# <<< proxyspy 111 <<< junk\n"
+    assert proxyspy._strip_managed_block(text) == text
+
+
+@pytest.mark.skipif(os.name != "posix", reason="hosts file locking is POSIX-only")
+def test_concurrent_removals_do_not_resurrect_blocks(tmp_path, monkeypatch, pids):
+    """Two sessions cleaning up at once must not each write back the other's
+    block. A delay between each call's read and write makes the race
+    deterministic without the lock: both would read A+B, one writes B, the
+    other writes A, and a removed block comes back."""
+    foreign, _ = pids
+    mine = os.getpid()
+    hosts_path = tmp_path / "hosts"
+    hosts_path.write_text(
+        "127.0.0.1 localhost\n" + _fenced("a.example.com", mine) + _fenced("b.example.com", foreign)
+    )
+
+    real_strip = proxyspy._strip_managed_block
+
+    def slow_strip(text, keep=None):
+        result = real_strip(text, keep=keep)
+        time.sleep(0.3)
+        return result
+
+    monkeypatch.setattr(proxyspy, "_strip_managed_block", slow_strip)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(
+                lambda pid: proxyspy.remove_managed_hosts(hosts_path=str(hosts_path), pid=pid),
+                [mine, foreign],
+            )
+        )
+
+    assert results == [True, True]
+    assert hosts_path.read_text() == "127.0.0.1 localhost\n"
+    assert (tmp_path / ("hosts" + proxyspy.HOSTS_LOCK_SUFFIX)).exists()
+
+
+@pytest.mark.skipif(os.name == "posix", reason="checks the non-POSIX guard")
+def test_pid_alive_refuses_off_posix():
+    with pytest.raises(NotImplementedError):
+        proxyspy._pid_alive(os.getpid())
 
 
 @pytest.mark.skipif(os.name != "posix", reason="PID liveness check is POSIX-only")
