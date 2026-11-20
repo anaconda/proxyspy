@@ -1,321 +1,44 @@
-# HTTPS Debug Proxy
+# proxyspy
 
 [![Build and Test](https://github.com/anaconda/proxyspy/actions/workflows/main.yaml/badge.svg)](https://github.com/anaconda/proxyspy/actions/workflows/main.yaml)
 [![Latest Release](https://img.shields.io/github/v/release/anaconda/proxyspy?include_prereleases)](https://github.com/anaconda/proxyspy/releases/latest)
 [![PyPI version](https://img.shields.io/pypi/v/proxyspy.svg)](https://pypi.org/project/proxyspy/)
-[![Conda Version](https://img.shields.io/conda/v/mcg/proxyspy)](https://anaconda.org/mcg/proxyspy)
+[![Conda Version](https://img.shields.io/conda/v/conda-forge/proxyspy)](https://anaconda.org/conda-forge/proxyspy)
 
-A debugging proxy that can log or intercept HTTPS requests. This tool can be used to:
+proxyspy shows you the HTTPS requests your program sends and the responses it
+gets back. To see both sides of one request, install it with
+`conda install conda-forge::proxyspy` or `python -m pip install proxyspy`, then run:
 
-- Monitor HTTPS traffic from applications
-- Debug SSL/TLS issues
-- Test applications against specific HTTP responses
-- Simulate network delays
-
-## Features
-
-- Full HTTPS request/response logging
-- Custom response injection
-- Automatic certificate generation
-- Connection delays for testing
-- Concurrent connection support
-- Binary data handling
-- Automatic port selection
-
-## Installation
-
-ProxySpy is available on both Conda-Forge and PyPi:
-
-```bash
-conda install conda-forge::proxyspy  # or...
-pip install proxyspy
+```sh
+proxyspy -l headers.log -- curl -I https://example.org/
 ```
 
-Installing it this way ensures that its `cryptography` dependency is also
-available, and add the `proxyspy` command to your `PATH` when this Python
-environment is activated.
-
-This utility has been deliberately designed to function as a single-file
-Python script that depends only upon the standard Python 3 library and the
-`cryptography` package. For that reason, you can also vendor the script
-directly into your work environment if you wish.
-
-1. Copy `proxyspy.py` directly into your project.
-   [Here](https://raw.githubusercontent.com/anaconda/proxyspy/refs/heads/main/proxyspy.py)
-   is a direct download link to the latest version of the script.
-2. Ensure the `cryptography` package is available in your Python environment:
-   ```
-   conda install cryptography  # or...
-   pip install cryptography
-   ```
-
-## Development Requirements
-
-To develop or test the proxy itself, additional packages are required:
-
-```bash
-conda install --file requirements.txt
-```
-
-This will install:
-- cryptography (required for proxy operation)
-- requests (for tests)
-- pytest (for running tests)
-
-## Usage
-
-```bash
-proxyspy [options] -- command [args...]            # Installed as a package
-python proxyspy.py [options] -- command [args...]  # Direct access
-```
-
-The tool starts a proxy server and then runs the specified command with appropriate proxy environment variables set.
-
-### Options
-
-- `--logfile FILE, -l FILE`: Write logs to FILE (default: stdout)
-- `--port PORT, -p PORT`: Listen on PORT (default: auto-select)
-- `--keep-certs`: Keep certificates in current directory
-- `--delay TIME`: Add TIME seconds delay to each connection
-- `--return-code N, -r N`: Return status code N for all requests
-- `--return-header H`: Add header H to responses (can repeat)
-- `--return-data DATA`: Return DATA as response body
-- `--intercept-host HOST`: Only intercept requests to HOST (can repeat)
-- `--prepare-host HOST`: Pre-generate the certificate for HOST to avoid first-connection delay (can repeat)
-- `--standalone`: Run the forward proxy standalone: instead of running a command, print the proxy/CA environment variables to set in another terminal (and write them to `<cert-dir>/env` for sourcing), then block until interrupted (see below)
-- `--reverse`: Run as a standalone reverse/transparent proxy instead of running a command (see below)
-- `--manage-hosts`: Automatically add/remove the `/etc/hosts` redirects for declared hosts for the run's lifetime (reverse mode only; POSIX only; see below)
-- `--restore-hosts`: Remove any proxyspy-managed block from `/etc/hosts` and exit (standalone; POSIX only)
-- `--cert-dir DIR`: Directory for the persistent CA and host certificates (reverse and standalone mode default: `~/.proxyspy`)
-- `--map HOST=UPSTREAM`: Send HOST's decrypted traffic to UPSTREAM instead of its real address (forward and reverse modes; can repeat). See [Upstream Mapping](#upstream-mapping---map)
-- `--upstream-port PORT`: Port to dial on the real upstream servers in reverse mode (default: 443)
-- `--add-header H`: Set request header H (`"Name: Value"`) on every request sent to a `--map` host (forward and reverse modes; can repeat). See [Request Header Injection](#request-header-injection---add-header)
-
-### Examples
-
-Log all HTTPS requests to test.log:
-
-```bash
-proxyspy --logfile test.log -- curl https://httpbingo.org/ip
-```
-
-Return 404 for all requests with a half-second delay:
-
-```bash
-proxyspy --return-code 404 --delay 0.5 -- python my_script.py
-```
-
-Return custom response with headers and body:
-
-```bash
-proxyspy --return-code 200 \
-         --return-header "Content-Type: application/json" \
-         --return-data '{"status": "ok"}' \
-         -- ./my_script.py
-```
-
-Use specific port instead of auto-selection:
-
-```bash
-proxyspy.py --port 8888 -- curl https://httpbingo.org/ip
-```
-
-Intercept only requests to specific domains:
-
-```bash
-proxyspy --return-code 404 \
-         --intercept-host "conda.anaconda.org" \
-         --intercept-host "repo.anaconda.com" \
-         -- python conda_script.py
-```
-
-Run the proxy standalone and drive it from a second terminal:
-
-```bash
-proxyspy --standalone -l spy.log
-```
-
-Put a local plain-HTTP service (e.g. `wrangler dev`) in front of a real HTTPS host, for one client only:
-
-```bash
-proxyspy --map example.com=http://127.0.0.1:8787 -- curl -s https://example.com/x
-```
-
-## How It Works
-
-The proxy operates in two modes and can optionally add delays to any connection:
-
-### Forwarding Mode (default)
-- Creates a CA certificate and per-host certificates
-- Establishes SSL tunnels to requested hosts
-- Logs all traffic passing through
-- Runs a command as a subprocess, or blocks standalone with `--standalone` (see [Standalone Forward Mode](#standalone-forward-mode))
-
-### Interception Mode
-- Activated by specifying any of: --return-code, --return-data, --return-header
-- Returns custom responses instead of connecting to servers
-- Useful for testing application behavior
-
-### Connection Delays
-- Optional delay can be added to any connection in either mode
-- Delay occurs after connection but before SSL handshake
-- Useful for testing timeout and connection handling
-
-### Port Selection
-- By default, the proxy automatically selects an available port
-- This prevents socket reuse issues and allows running multiple instances
-- A specific port can be chosen with the --port option
-
-## Upstream Mapping (`--map`)
-
-`--map HOST=UPSTREAM` sends the decrypted traffic for `HOST` somewhere other than its real address. The client still sees a normal HTTPS connection to `HOST` (proxyspy presents its MITM certificate for `HOST` as usual); only the proxy-to-server leg changes. It works in forward mode (including `--standalone`) and in reverse mode, and can be repeated for several hosts. Hosts without a `--map` entry are unaffected and still reach their real destinations.
-
-A mapping matches on host name only (case-insensitively), so it applies to every port the client connects to on that host; with an `IP`-only value in forward mode, that port is carried through to the upstream. A mapped host also counts as declared, like `--prepare-host`: its certificate is generated at startup.
-
-`UPSTREAM` takes one of these forms:
-
-| Value | Upstream connection |
-|---|---|
-| `IP` | TLS to `IP`; the port comes from the CONNECT request in forward mode, or `--upstream-port` in reverse mode |
-| `IP:PORT` | TLS to `IP:PORT` |
-| `https://H[:P]` | TLS to `H:P` (default port 443) |
-| `http://H[:P]` | Plain TCP to `H:P` (default port 80), no upstream TLS |
-
-TLS upstreams are always verified against the original `HOST` name (via SNI and certificate hostname checking), even when dialing a different address, so the upstream must present a certificate valid for `HOST` that the proxy process trusts. The request bytes are relayed unchanged: the `Host` header and path are not rewritten, so the upstream sees `Host: HOST`.
-
-Example: route one client's requests for `example.com` to a Cloudflare worker running under `wrangler dev`, without touching `/etc/hosts` or any other process on the machine:
-
-```bash
-proxyspy --map example.com=http://127.0.0.1:8787 -- curl -s https://example.com/x
-```
-
-In reverse mode, a `--map` target is resolved once at startup, before any `/etc/hosts` redirects are installed, and its addresses are tried in order when connecting. So `--map api.example=https://api.example:8443` (same host, different port) reaches the real server rather than the redirect. A `--map` value is treated as intentional and is not subjected to the loopback check, so `--map HOST=http://127.0.0.1:8787` is allowed even though `HOST` itself is redirected to proxyspy in `/etc/hosts`. The one exception is a mapping that would connect back to proxyspy's own listen address (`127.0.0.1` on the listen port), for example a bare `--map HOST=127.0.0.1` with the default `--upstream-port 443`; that would loop, so proxyspy refuses to start. Mapped hosts are included in the `/etc/hosts` redirects that `--manage-hosts` writes (and in the instructions printed without it), so `sudo proxyspy --reverse --manage-hosts --map HOST=http://127.0.0.1:8787` is self-contained.
-
-## Request Header Injection (`--add-header`)
-
-A service that normally sits behind other infrastructure often expects headers that infrastructure adds — for example `CF-Connecting-IP` from Cloudflare's edge, or `X-Forwarded-For` from a load balancer. `--add-header "Name: Value"` lets you simulate them when proxyspy fronts that service with `--map`:
-
-```bash
-proxyspy --map example.com=http://127.0.0.1:8787 \
-         --add-header "CF-Connecting-IP: 203.0.113.7" \
-         --add-header "X-Forwarded-For: 203.0.113.7" \
-         -- python my_client.py
-```
-
-Behavior:
-
-* **Set semantics.** Any existing header with the same name (case-insensitive) is removed and the given one is added, so a header sent by the client is replaced, never duplicated. Repeat the option to set several headers; if the same name (in any case) is given more than once, the last value wins.
-* **Mapped hosts only.** Headers are applied only to traffic for hosts with a `--map` entry, so they are never sent to unrelated real hosts. Without `--map`, `--add-header` has no effect (proxyspy logs a warning).
-* **Every request.** Clients such as `requests`/conda reuse keep-alive connections, so proxyspy frames the client's requests and rewrites each request head on the connection, not just the first. Request bodies with a `Content-Length` are forwarded untouched. The rewritten heads appear in the log.
-* **Fallback.** proxyspy does not decode request bodies. If a request uses `Transfer-Encoding` (e.g. chunked uploads), asks for a protocol upgrade (e.g. WebSocket, including an `Upgrade` header set with `--add-header`), or its head cannot be parsed, proxyspy logs a warning and passes the rest of that connection through unmodified. The current request still gets the headers if its head was parsed; later requests on that connection do not.
-* Responses are never modified, and `Content-Length`/`Transfer-Encoding` cannot be set (they control message framing). Works in forward and reverse modes.
-
-## Standalone Forward Mode
-
-`--standalone` runs the ordinary forward proxy, but instead of launching a command as a subprocess it prints the environment variables a client needs, writes them to a source-able file, and blocks until you press Ctrl-C. Use it when the client you want to watch cannot run as a proxyspy subprocess — for example a long-lived service, an IDE, or a shell session you drive by hand.
-
-On startup it prints a copy-pasteable banner to stdout (always, even with `-l`/`--logfile`), and writes the same `export` lines to `<cert-dir>/env` (default `~/.proxyspy/env`):
-
-```
-========================================================================
-ProxySpy standalone (forward proxy) listening on http://localhost:54321
-
-Paste into another terminal to route HTTPS through ProxySpy:
-
-    export HTTP_PROXY=http://localhost:54321
-    export HTTPS_PROXY=http://localhost:54321
-    ...
-    export SSL_CERT_FILE=/Users/you/.proxyspy/cert.pem
-    export CONDA_SSL_VERIFY=/Users/you/.proxyspy/cert.pem
-
-...or just:  source /Users/you/.proxyspy/env
-
-Press Ctrl-C to stop.
-========================================================================
-```
-
-Workflow:
-
-* In terminal 1, start the proxy: `proxyspy --standalone -l spy.log`.
-* In terminal 2, either paste the printed `export` lines or run `source ~/.proxyspy/env`, then run your client. Its HTTPS traffic is now proxied and logged to `spy.log`.
-* Press Ctrl-C in terminal 1 to stop. The env file is removed on exit so it never points at a released port.
-
-Notes:
-
-* No root is needed — standalone auto-selects an unprivileged port (unlike reverse mode, which defaults to privileged port 443).
-* Clients only trust the CA via the `*_CA_BUNDLE` / `SSL_CERT_FILE` / `CONDA_SSL_VERIFY` variables, so this exercises the *proxied* code path. Tools that ignore those variables (or bypass proxy env vars entirely) won't be intercepted; for those, use reverse mode.
-* `--cert-dir` overrides where the persistent CA and the `env` file live.
-
-## Reverse / Transparent Mode
-
-`--reverse` runs proxyspy as a standalone transparent MITM that emulates a **TLS-intercepting corporate firewall**: it listens on `127.0.0.1` (default port 443) and learns the target hostname from the TLS SNI field. You redirect the hostnames you want to watch to `127.0.0.1` in `/etc/hosts`, and the client connects to proxyspy normally — with no proxy configured and no idea a proxy exists.
-
-This matters because forward mode works by setting `HTTPS_PROXY`, so it can only exercise a client's *proxied* code path. Some clients behave differently with and without a proxy configured, so the proxied path is not a faithful stand-in for a user behind a transparent intercepting firewall. For example, in [conda/conda#16253](https://github.com/conda/conda/pull/16253) `requests` applied a `truststore` SSL context on its direct-connection path but dropped it on the separate proxy path, so verification against a MITM firewall's certificate silently failed *only* under a proxy. Reverse mode lets proxyspy intercept the TLS handshake while the client still takes its direct, no-proxy path, making that class of difference reproducible. The two modes are complementary test surfaces.
-
-Because `/etc/hosts` redirects the target hostnames to proxyspy itself, proxyspy cannot use the OS resolver to reach the real upstream once those entries are in place. It therefore resolves and caches each declared host's real addresses (and each `--map` target's) **at startup** — so you must start proxyspy *before* editing `/etc/hosts`. If a declared host already resolves to a loopback address, proxyspy refuses to start and tells you to remove it from `/etc/hosts` or pin it with `--map HOST=IP`.
-
-Workflow:
-
-* Start proxyspy as root (port 443 is privileged), declaring the hosts to watch with `--prepare-host` (forward+log) or `--intercept-host` (return canned responses):
-  ```bash
-  sudo proxyspy --reverse --prepare-host repo.anaconda.com -l spy.log
-  ```
-* Trust the CA certificate it prints (default `~/.proxyspy/cert.pem`) in your client/system trust store. The CA persists across runs, so you only trust it once.
-* Add the redirects to `/etc/hosts`:
-  ```
-  127.0.0.1 repo.anaconda.com
-  ```
-* Run your client normally and watch `spy.log`.
-* Press Ctrl-C to stop proxyspy, then remove the `/etc/hosts` entries.
-
-Notes:
-
-* `--cert-dir` overrides where the persistent CA and host certificates live. Under `sudo`, the default `~/.proxyspy` resolves to the invoking user's home (via `SUDO_USER`), not root's.
-* `--map HOST=IP` pins an upstream IP, bypassing startup resolution. Use it when a host is already in `/etc/hosts`, or to target a specific backend. The other `--map` forms (`IP:PORT`, `https://…`, `http://…`) work here too; see [Upstream Mapping](#upstream-mapping---map).
-* A host listed only in `--intercept-host` (with no forwarding) never connects upstream, so it is not resolved.
-* A `--map` host counts as declared, so `--manage-hosts` redirects it without also needing `--prepare-host`.
-
-### Automatic `/etc/hosts` management (opt-in)
-
-Add `--manage-hosts` to have proxyspy add and remove the `/etc/hosts` redirects itself, so a session is self-contained: start it, use it, Ctrl-C, and the file is back to how it was. This replaces steps 3 and 5 of the manual workflow above; everything else (running as root, trusting the CA) is unchanged:
-
-```bash
-sudo proxyspy --reverse --manage-hosts --prepare-host repo.anaconda.com -l spy.log
-```
-
-proxyspy writes a fenced block to `/etc/hosts` containing only the redirects for the declared hosts, keeping a one-time backup at `/etc/hosts.proxyspy.bak`, and removes the block on a clean exit (Ctrl-C or SIGTERM). The block's fences are tagged with the owning process's PID (e.g. `# >>> proxyspy 12345 >>>`), so concurrent `--manage-hosts` sessions do not clobber each other: each run removes only its own block on exit, and startup self-heal removes only blocks whose owner is no longer running. Edits are serialized between proxyspy processes with a lock on `/etc/hosts.proxyspy.lock`, a small file that is left in place. If a previous run is killed uncatchably (`SIGKILL`, power loss) and leaves the block behind, the next `--manage-hosts` start self-heals by removing it before resolving upstreams. Liveness is judged by PID, so if an unrelated process happens to reuse a dead session's PID, that session's block is kept until the PID exits; to force-clean a stale block without starting proxyspy, run:
-
-```bash
-sudo proxyspy --restore-hosts
-```
-
-`--manage-hosts` and `--restore-hosts` are POSIX-only (they edit `/etc/hosts` directly) and require root, since editing `/etc/hosts` needs the same privileges as binding port 443.
+curl prints the response headers. In `headers.log`, look for `[C->S] HEAD /`
+to see what curl sent and `[S->C]` for the server's reply. proxyspy sets up the
+proxy and certificate trust for this command only. The log contains decrypted
+traffic, so use test credentials and check logs before sharing them.
+
+## Choose a guide
+
+- [Inspect headers from a conda test](https://github.com/anaconda/proxyspy/blob/main/docs/forward.md#inspect-the-headers-conda-sends): let the forward proxy start the client and stop when it exits.
+- [Try a local Wrangler Worker](https://github.com/anaconda/proxyspy/blob/main/docs/forward.md#send-a-channel-request-to-a-local-worker): leave the forward proxy running and try several clients without changing their channel URLs.
+- [Test behind a TLS-terminating firewall](https://github.com/anaconda/proxyspy/blob/main/docs/reverse.md): use the reverse proxy when the client must make a direct HTTPS connection with no proxy configured.
+- [Change what happens to a request](https://github.com/anaconda/proxyspy/blob/main/docs/options.md): choose an upstream, add a request header, return a canned response, or delay a connection.
+
+The guides use proxyspy 0.3 or later and POSIX shell syntax. Run
+`proxyspy --help` for the options available in your installation.
 
 ## Development
 
-Run tests:
-```bash
-pytest -v
+proxyspy is a [single Python file](https://github.com/anaconda/proxyspy/blob/main/proxyspy.py).
+You can vendor it and run `python proxyspy.py` with Python 3.10+ and
+`cryptography`, its only third-party runtime dependency. Please keep it that
+way when contributing, and include tests for new behavior. From a checkout:
+
+```sh
+conda install --file requirements.txt
+python -m pytest -v
 ```
 
-The test suite covers:
-- Basic forwarding
-- Response interception
-- Binary data handling
-- Connection delays
-- Error conditions
-- Sequential proxy starts
-
-## Contributing
-
-When submitting pull requests, please:
-- Add tests for new features
-- Ensure all tests pass
-- Follow existing code style
-- Do not add third-party dependencies beyond the required `cryptography` package
-  - The proxy tester is designed to be a single, self-contained file
-  - Additional dependencies make it harder for users to incorporate into their projects
-
-## About This Project
-
-This project was primarily developed through a series of conversations with Claude 3.5 and 3.7 Sonnet, an AI assistant from Anthropic (https://claude.ai). The majority of the code, including the test suite and GitHub Actions configuration, was written by Claude in response to requirements and refinements from human developers. This collaborative approach demonstrates how AI assistance can help create well-tested, maintainable code while adhering to strict dependency and design constraints.
+The original implementation and test suite were developed with Claude 3.5 and
+3.7 Sonnet.
