@@ -8,17 +8,19 @@ client asked for.
 ## Give the client a known response
 
 To see how a client handles a service outage, have proxyspy answer for the
-server. This example stays on your machine; `channel.test` doesn't need DNS:
+server. This example stays on your machine; `api.test` doesn't need DNS:
 
 ```sh
-proxyspy --intercept-host channel.test --return-code 503 \
+proxyspy --intercept-host api.test --return-code 503 \
   --return-header 'Retry-After: 10' --return-data 'try again' \
-  -- curl -si https://channel.test/notices.json
+  -- curl -si https://api.test/health
 ```
 
 Look for `HTTP/1.1 503 Intercepted`, the `Retry-After` header, and `try again`.
 With curl, you may also see `200 Connection Established`: that's the forward
-proxy accepting the tunnel, not the status of the request inside it.
+proxy accepting the tunnel, not the status of the request inside it. Replace
+curl with your client to check whether it reports the outage or retries;
+each retry should produce another request in the log.
 
 Any `--return-*` option turns on canned responses. The defaults are status
 `200` and an empty body; repeat `--return-header` for multiple headers. The
@@ -34,7 +36,7 @@ connection, even if that host also has a `--map` entry.
 ## Change the destination
 
 Use `--map HOST=UPSTREAM` when you want a different server to answer, as in
-the [local Worker example](forward.md#send-a-channel-request-to-a-local-worker).
+the [local service example](forward.md#send-one-hostname-to-a-local-service).
 The client still asks for `HOST`. The mapping changes where proxyspy dials;
 it doesn't rewrite the path or `Host` header.
 

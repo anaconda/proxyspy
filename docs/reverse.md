@@ -1,107 +1,87 @@
 # Test behind a TLS-terminating firewall
 
-A client behind this kind of firewall asks for `https://channel.test` as
-usual. The firewall answers the TLS handshake with a certificate for
-`channel.test` signed by its own CA. There is no proxy URL in the client's
-configuration and no HTTP `CONNECT` request. Use `--reverse` when that
-difference is part of the test.
+Use `--reverse` when you need to know what a client does on a **direct HTTPS
+connection**. A forward proxy would make the client send `CONNECT` instead.
+Here the client asks for the service by name as usual, but connects to
+proxyspy on loopback. Like a TLS-terminating firewall, proxyspy presents a
+certificate for the service signed by its own certificate authority (CA).
 
 ```text
-Processes                      Request when forwarding
-terminal 1: proxyspy           client (no proxy configured)
-terminal 2: conda or curl        | TLS to loopback, SNI = channel.test
-                                 v
-                               proxyspy, certificate for channel.test
-                                 | new TLS connection to upstream
-                                 v
-                               channel server
+Processes                   Request when forwarding
+terminal 1: proxyspy        client (no proxy configured)
+terminal 2: your client       | TLS to loopback, SNI = api.test
+                              v
+                            proxyspy, certificate for api.test
+                              | new TLS connection to upstream
+                              v
+                            server
 ```
 
-The client and proxyspy run independently. The client chooses the hostname;
-proxyspy reads it from the TLS handshake (Server Name Indication, or SNI).
-Use a hostname in the URL even when the connection goes to `127.0.0.1`.
-Connecting to `https://127.0.0.1` loses the name the proxy needs.
+The client runs independently of proxyspy. Use the service hostname in the
+URL: proxyspy reads that name from the TLS handshake (Server Name Indication,
+or SNI). Replacing it with `https://127.0.0.1` loses the name you're testing.
 
 ## Make one direct request
 
-To try this without root, DNS changes, or a system-wide trusted CA, let curl
-redirect just one name and port. In terminal 1:
+curl can redirect one name and port without root, DNS changes, or a
+system-wide trusted CA. In terminal 1, start a listener that answers for
+`api.test`:
 
 ```sh
 umask 077
-proxyspy --reverse --port 8443 --intercept-host channel.test --return-data 'channel test OK'
+proxyspy --reverse --port 8443 --intercept-host api.test --return-data 'service OK'
 ```
 
-Wait for `Reverse proxy listening on 127.0.0.1:8443` and the path to
-`cert.pem`. In terminal 2:
+Wait for `Reverse proxy listening on 127.0.0.1:8443`. In terminal 2:
 
 ```sh
-curl --noproxy '*' --resolve channel.test:8443:127.0.0.1 \
-  --cacert "$HOME/.proxyspy/cert.pem" https://channel.test:8443/
+curl --noproxy '*' --resolve api.test:8443:127.0.0.1 \
+  --cacert "$HOME/.proxyspy/cert.pem" https://api.test:8443/health
 ```
 
-curl should print `channel test OK`. `--noproxy '*'` keeps curl on its direct
-connection path even if your shell has proxy variables. `--resolve` changes
-only the address curl dials, so it still checks the certificate for
-`channel.test`. `--cacert` trusts the CA for this command only. The proxy log
-should say `SSL handshake completed (SNI: channel.test)`. Here proxyspy makes
-the reply itself, so there is no second TLS connection. Stop it with Ctrl-C.
-
-## Why conda needed both modes
-
-In [conda#16252](https://github.com/conda/conda/issues/16252), conda was set
-to `ssl_verify: truststore`, meaning it should trust CAs in the operating
-system's store. Direct connections used that setting. When an explicit proxy
-was configured, Requests used a different connection manager to which conda
-hadn't passed the SSL context. A certificate trusted only by the OS could
-then be rejected. [The fix](https://github.com/conda/conda/pull/16253) passed
-the same context to the proxy manager.
-
-A normal `proxyspy -- conda ...` run configures both an explicit proxy and a
-**CA file** for the child. A successful run that way says nothing about
-whether conda used the OS trust store. Reverse mode supplied the missing
-comparison: the firewall could still present a locally signed certificate
-while conda made a direct connection. The curl example above checks that
-routing; it doesn't test OS trust, either, because it names a CA file.
+curl should print `service OK`. `--noproxy '*'` makes it connect directly
+even if your shell has proxy variables. `--resolve` changes the address curl
+dials, not the name on the certificate it checks. `--cacert` trusts proxyspy's
+CA for this command only. Look for `SSL handshake completed (SNI: api.test)`
+in the log, followed by `GET /health`, with no `CONNECT`. There is no upstream
+connection in this example: proxyspy supplied the reply. Stop it with Ctrl-C.
 
 ## Keep the client's usual hostname and port
 
-For a client without curl's `--resolve`, use a disposable test machine. A
-hosts-file redirect affects **every process on that machine** that resolves
-the name, including applications outside your test. This example forwards to
-a real conda channel. Use a test installation with no repository credentials.
-In the proxy terminal, create a private directory for this run's keys:
+Some clients can't override DNS for a single request. To try one without
+changing its URL, use a disposable test machine: a hosts-file redirect
+affects **every process on that machine** that resolves the name. This
+example forwards to a real HTTPS server. In the proxy terminal:
 
 ```sh
 ca_dir=$(mktemp -d)
-sudo proxyspy --reverse --cert-dir "$ca_dir" --manage-hosts --prepare-host repo.anaconda.com
+sudo proxyspy --reverse --cert-dir "$ca_dir" --manage-hosts --prepare-host example.org
 ```
 
-proxyspy looks up the real addresses for `repo.anaconda.com` **before** adding
-its loopback redirect to `/etc/hosts`. It listens on port 443, so conda
-needn't change its channel URL. On POSIX proxyspy requires root for that
-port; `--manage-hosts` is POSIX-only and also requires root.
+proxyspy looks up the real addresses for `example.org` **before** adding its
+loopback redirect to `/etc/hosts`. It listens on the usual HTTPS port, 443.
+On POSIX proxyspy requires root for that port; `--manage-hosts` is POSIX-only
+and also requires root.
 
-To test OS trust, add the **public** `cert.pem` at the path proxyspy prints to
-the disposable machine's trust store. Don't install the private key. In a
-fresh terminal with no proxy or CA-bundle variables set and no `proxy_servers`
-configured in conda, run:
+Run your client in a separate terminal without an explicit proxy configured.
+For a routing check with curl, substitute the printed CA path below:
 
 ```sh
-CONDA_SSL_VERIFY=truststore conda notices --override-channels -c https://repo.anaconda.com/pkgs/main
+curl --noproxy '*' --cacert /path/from/proxyspy/cert.pem -I https://example.org/
 ```
 
-Look for a new `[C<>P]` handshake with SNI `repo.anaconda.com` and no
-`CONNECT`, followed by `[P<>S]` and the request for `/pkgs/main/notices.json`.
-The first handshake checks conda's trust in the test CA; for the second,
-proxyspy verifies the real channel's certificate. An empty log doesn't
-establish anything about trust: the request needs to reach the listener.
+This time you should see **two** handshakes: `[C<>P]` with SNI `example.org`,
+then `[P<>S]` as proxyspy verifies the real server's certificate. If you're
+testing whether your application uses the **operating system's trust store**,
+install the public `cert.pem` in the test machine's store and have the client
+use that store, not a CA file override. Keep verification on. The difference
+matters: see [Why conda needed both modes](case-studies.md#compare-two-certificate-trust-paths).
 
-Ctrl-C removes this run's managed redirects. Remove the CA from the test
-trust store and discard the temporary key directory. Proxyspy keeps a one-time
-backup at `/etc/hosts.proxyspy.bak`. After a crash, the next `--manage-hosts`
+Ctrl-C removes this run's managed redirects. Remove any trust you added and
+discard the temporary key directory. After a crash, the next `--manage-hosts`
 run cleans up blocks from dead sessions. To remove **all** managed blocks,
-stop other sessions first and run `sudo proxyspy --restore-hosts`.
+stop other sessions first and run `sudo proxyspy --restore-hosts`. proxyspy
+keeps a one-time backup at `/etc/hosts.proxyspy.bak`.
 
 If you manage `/etc/hosts` by hand, omit `--manage-hosts`. Start proxyspy
 first, wait for its listening message, then add only the redirects it lists;

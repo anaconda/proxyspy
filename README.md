@@ -7,7 +7,7 @@
 
 proxyspy shows you the HTTPS requests your program sends and the responses it
 gets back. To see both sides of one request, install it with
-`conda install conda-forge::proxyspy` or `python -m pip install proxyspy`, then run:
+`python -m pip install proxyspy` or `conda install conda-forge::proxyspy`, then run:
 
 ```sh
 proxyspy -l headers.log -- curl -I https://example.org/
@@ -20,10 +20,13 @@ traffic, so use test credentials and check logs before sharing them.
 
 ## Choose a guide
 
-- [Inspect headers from a conda test](https://github.com/anaconda/proxyspy/blob/main/docs/forward.md#inspect-the-headers-conda-sends): let the forward proxy start the client and stop when it exits.
-- [Try a local Wrangler Worker](https://github.com/anaconda/proxyspy/blob/main/docs/forward.md#send-a-channel-request-to-a-local-worker): leave the forward proxy running and try several clients without changing their channel URLs.
+- [See what a client sends](https://github.com/anaconda/proxyspy/blob/main/docs/forward.md#inspect-an-outgoing-request): run a command or test suite under the forward proxy and read the request alongside the server's response.
+- [Compare two clients](https://github.com/anaconda/proxyspy/blob/main/docs/forward.md#compare-clients-from-another-shell): leave the forward proxy running while you try requests from another shell.
+- [Send one hostname to a local service](https://github.com/anaconda/proxyspy/blob/main/docs/forward.md#send-one-hostname-to-a-local-service): keep the URL the client expects, but let your development server answer.
 - [Test behind a TLS-terminating firewall](https://github.com/anaconda/proxyspy/blob/main/docs/reverse.md): use the reverse proxy when the client must make a direct HTTPS connection with no proxy configured.
-- [Change what happens to a request](https://github.com/anaconda/proxyspy/blob/main/docs/options.md): choose an upstream, add a request header, return a canned response, or delay a connection.
+- [Test an error or timeout](https://github.com/anaconda/proxyspy/blob/main/docs/options.md): make a service return `503` or delay a handshake without changing the service itself.
+
+For examples from real projects, see the [conda plugin, Worker, and certificate trust case studies](https://github.com/anaconda/proxyspy/blob/main/docs/case-studies.md).
 
 The guides use proxyspy 0.3 or later and POSIX shell syntax. Run
 `proxyspy --help` for the options available in your installation.
@@ -36,7 +39,7 @@ You can vendor it and run `python proxyspy.py` with Python 3.10+ and
 way when contributing, and include tests for new behavior. From a checkout:
 
 ```sh
-conda install --file requirements.txt
+python -m pip install -e '.[test]'
 python -m pytest -v
 ```
 
