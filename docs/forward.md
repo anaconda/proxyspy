@@ -130,4 +130,4 @@ changes the destination for the named host; requests to other hosts still go
 to their real servers. Run the server outside the client's proxy environment
 so its own requests don't loop back to it. Stop the server with Ctrl-C when
 you're done. For a working example with a Cloudflare Worker instead of a
-file server, see [Test a Worker at the channel URL](case-studies.md#test-a-worker-at-the-channel-url).
+file server, see [Test a Cloudflare Worker locally](case-studies.md#test-a-cloudflare-worker-locally).

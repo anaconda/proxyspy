@@ -31,15 +31,16 @@ and `404 Intercepted` reply (`[P->C]`), not the exit code alone. No request
 goes upstream. Setting the cache lifetime to zero makes conda check for fresh
 metadata. Which fields you see depends on the plugins installed and enabled.
 
-## Test a Worker at the channel URL
+## Test a Cloudflare Worker locally
 
-In `ip-bouncer-worker` development, the server under test is a Cloudflare
-Worker running locally under Wrangler. A package client should still ask for
-its usual channel URL. [Mapping one hostname](forward.md#send-one-hostname-to-a-local-service)
-is enough: no reverse proxy, DNS edit, or change to the client's channel list.
+This example grew out of testing a Cloudflare Worker for traffic management:
+the client needed to keep its usual HTTPS URL while Wrangler ran the Worker
+on localhost. A forward proxy can [map that hostname to Wrangler](forward.md#send-one-hostname-to-a-local-service)
+for just the client under test, without a DNS change or a deployment.
 
-To try the routing without running that particular Worker, put this
-`worker.mjs` in an empty directory:
+To see which request reaches the Worker, use this `worker.mjs` in an empty
+directory. It echoes the request path and a test header; it makes no upstream
+requests.
 
 ```js
 export default {
@@ -57,20 +58,18 @@ With Node.js and Wrangler installed, start it in its own terminal:
 npx wrangler dev worker.mjs --local --ip 127.0.0.1 --port 8787 --compatibility-date 2025-08-03
 ```
 
-In another terminal, send a channel request to it:
+In another terminal, send a request for the test hostname `api.test`:
 
 ```sh
-proxyspy -l worker.log --map repo.anaconda.com=http://127.0.0.1:8787 \
+proxyspy -l worker.log --map api.test=http://127.0.0.1:8787 \
   --add-header 'X-Test-Run: local' -- \
-  curl -sS https://repo.anaconda.com/pkgs/main/noarch/repodata.json
+  curl -sS https://api.test/health
 ```
 
-The reply should be `GET /pkgs/main/noarch/repodata.json (run: local)`.
-That checks the path and header, not whether a package can be installed: the
-example returns text, not repodata. With a Worker that serves channel metadata,
-use the same map [in standalone mode](forward.md#compare-clients-from-another-shell)
-to compare conda, mamba, pixi, or curl. Keep Wrangler outside the proxy
-environment and use test bindings: a local Worker can still call real services.
+The reply should be `GET /health (run: local)`. curl asked for an HTTPS URL;
+the path and header in the reply came from the Worker on port 8787. To try
+your own client, use the same map [in standalone mode](forward.md#compare-clients-from-another-shell).
+Keep Wrangler outside the client's proxy environment. Stop it with Ctrl-C.
 
 ## Compare two certificate trust paths
 
