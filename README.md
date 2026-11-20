@@ -44,4 +44,5 @@ python -m pytest -v
 ```
 
 The original implementation and test suite were developed with Claude 3.5 and
-3.7 Sonnet.
+3.7 Sonnet. Since then, contributors have used a range of models from several
+vendors to develop proxyspy.
